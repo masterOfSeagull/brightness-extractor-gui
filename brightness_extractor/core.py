@@ -38,7 +38,6 @@ class ExtractorConfig:
     atmosphere_weight_floor: float = 0.20
     atmosphere_weight_power: float = 0.50
     apply_soft_mask_to_output: bool = True
-    clamp_brightness: bool = True
     restarts: int = 16
     max_iterations: int = 100
     convergence_tolerance: float = 1e-7
@@ -56,6 +55,10 @@ class ExtractorConfig:
     def from_dict(cls, values: dict) -> "ExtractorConfig":
         if not isinstance(values, dict):
             raise ValueError("settings must be an object")
+        values = dict(values)
+        # Version-2 settings exposed this misleading switch. PNG maps and alpha
+        # are always clipped at save time; retain raw coefficients internally.
+        values.pop("clamp_brightness", None)
         if set(values) - set(cls.__dataclass_fields__):
             raise ValueError("unknown extractor setting")
         config = cls(**values)
@@ -65,50 +68,85 @@ class ExtractorConfig:
 
 @dataclass
 class ExtractionResult:
-    brightness_map: np.ndarray
-    main_color_map: np.ndarray
+    palette_working: np.ndarray
+    palette_linear: np.ndarray
+    palette_srgb: np.ndarray
     labels: np.ndarray
-    soft_mask: np.ndarray
-    palette: np.ndarray
+    threshold_mask: np.ndarray
+    input_alpha: np.ndarray
+    k_linear_raw: np.ndarray
+    k_srgb_raw: np.ndarray
+    main_color_map_working: np.ndarray
     config: ExtractorConfig
     statistics: dict[str, object] = field(default_factory=dict)
     source_bit_depth: int = 8
 
-    def reconstruction(self) -> np.ndarray:
-        return self.main_color_map * self.brightness_map[..., None]
+    @property
+    def valid_mask(self) -> np.ndarray: return self.labels >= 0
+    @property
+    def palette(self) -> np.ndarray: return self.palette_working
+    @property
+    def main_color_map(self) -> np.ndarray: return self.main_color_map_working
+    @property
+    def soft_mask(self) -> np.ndarray: return self.threshold_mask * self.input_alpha
 
-    def palette_srgb(self) -> np.ndarray:
-        return _linear_to_srgb(self.palette) if self.config.working_space == "linear_rgb" else np.clip(self.palette, 0, 1)
+    def _asset_alpha(self, coefficient: np.ndarray) -> np.ndarray:
+        mask = self.threshold_mask if self.config.apply_soft_mask_to_output else 1.0
+        return np.clip(self.input_alpha * mask * coefficient * self.valid_mask, 0, 1).astype(np.float32)
+
+    def linear_asset_alpha(self) -> np.ndarray: return self._asset_alpha(self.k_linear_raw)
+    def srgb_asset_alpha(self) -> np.ndarray: return self._asset_alpha(self.k_srgb_raw)
+
+    def reconstruction_working(self) -> np.ndarray:
+        coefficient = self.k_linear_raw if self.config.working_space == "linear_rgb" else self.k_srgb_raw
+        rgb = self.main_color_map_working * coefficient[..., None]
+        if self.config.apply_soft_mask_to_output: rgb *= self.threshold_mask[..., None]
+        return np.clip(rgb, 0, 1)
+
+    def reconstruction_original_alpha_rgba(self) -> np.ndarray:
+        rgb = self.reconstruction_working()
+        if self.config.working_space == "linear_rgb": rgb = _linear_to_srgb(rgb)
+        alpha = np.where(self.valid_mask, self.input_alpha, 0).astype(np.float32)
+        rgb[alpha == 0] = 0
+        return np.dstack((_to_u8(rgb), _to_u8(alpha)))
+
+    def reconstruction(self) -> np.ndarray:
+        """Compatibility view: configured-working-space reconstruction."""
+        return self.reconstruction_working()
 
     def save(self, output_dir: str | Path, source_path: str | Path | None = None) -> dict[str, Path]:
         """Save a self-contained extraction bundle with concise, stable asset names."""
         target = Path(output_dir); target.mkdir(parents=True, exist_ok=True)
-        paths = {"brightness": target / "brightness.png", "main_color": target / "main_color.png",
-                 "labels": target / "labels.png", "soft_mask": target / "soft_mask.png",
-                 "asset_rgba": target / "asset_rgba.png", "reconstruction_green": target / "reconstruction_green.png",
-                 "palette": target / "palette.json"}
+        paths = {"main_color": target / "main_color.png", "labels": target / "labels.png",
+                 "threshold_mask": target / "threshold_mask.png", "input_alpha": target / "input_alpha.png",
+                 "brightness_k_linear": target / "brightness_k_linear.png", "brightness_k_srgb": target / "brightness_k_srgb.png",
+                 "asset_alpha_linear_k": target / "asset_alpha_linear_k.png", "asset_alpha_srgb_k": target / "asset_alpha_srgb_k.png",
+                 "reconstruction_original_alpha": target / "reconstruction_original_alpha.png", "palette": target / "palette.json"}
         if source_path is not None:
             source = Path(source_path)
             if source.is_file():
                 paths["original"] = target / f"original{source.suffix.lower()}"
                 shutil.copy2(source, paths["original"])
-        _save_gray16(paths["brightness"], self.brightness_map); _save_gray16(paths["soft_mask"], self.soft_mask)
-        Image.fromarray(np.where(self.labels >= 0, self.labels + 1, 0).astype(np.uint16), mode="I;16").save(paths["labels"])
-        palette_srgb = self.palette_srgb(); valid = self.labels >= 0
+        _save_gray16(paths["threshold_mask"], self.threshold_mask); _save_gray16(paths["input_alpha"], self.input_alpha)
+        _save_gray16(paths["brightness_k_linear"], np.where(self.valid_mask, self.k_linear_raw, 0))
+        _save_gray16(paths["brightness_k_srgb"], np.where(self.valid_mask, self.k_srgb_raw, 0))
+        Image.fromarray(np.where(self.valid_mask, self.labels + 1, 0).astype(np.uint16)).save(paths["labels"])
+        valid = self.valid_mask
         color_srgb = np.zeros((*self.labels.shape, 3), dtype=np.float32)
-        if np.any(valid): color_srgb[valid] = palette_srgb[self.labels[valid]]
+        if np.any(valid): color_srgb[valid] = self.palette_srgb[self.labels[valid]]
         color_u8 = _to_u8(color_srgb)
         Image.fromarray(np.dstack((color_u8, np.where(valid, 255, 0).astype(np.uint8))), mode="RGBA").save(paths["main_color"])
-        Image.fromarray(np.dstack((color_u8, _to_u8(self.brightness_map))), mode="RGBA").save(paths["asset_rgba"])
-        reconstruction = np.clip(self.reconstruction(), 0, 1)
-        if self.config.working_space == "linear_rgb": reconstruction = _linear_to_srgb(reconstruction)
-        green_screen = np.zeros_like(reconstruction); green_screen[..., 1] = 1
-        green_screen[valid] = reconstruction[valid]
-        Image.fromarray(_to_u8(green_screen), mode="RGB").save(paths["reconstruction_green"])
-        metadata = {"format_version": 2, "working_space": self.config.working_space, "null_label_in_memory": -1,
+        Image.fromarray(np.dstack((color_u8, _to_u8(self.linear_asset_alpha()))), mode="RGBA").save(paths["asset_alpha_linear_k"])
+        Image.fromarray(np.dstack((color_u8, _to_u8(self.srgb_asset_alpha()))), mode="RGBA").save(paths["asset_alpha_srgb_k"])
+        Image.fromarray(self.reconstruction_original_alpha_rgba(), mode="RGBA").save(paths["reconstruction_original_alpha"])
+        metadata = {"format_version": 3, "fit_working_space": self.config.working_space, "input_assumed_color_space": "srgb",
+                    "input_alpha_representation": "straight", "null_label_in_memory": -1,
                     "null_label_in_png": 0, "png_palette_labels": "1..N correspond to JSON palette entries 0..N-1",
-                    "config": asdict(self.config), "palette_working_rgb": self.palette.astype(float).tolist(),
-                    "palette_srgb": palette_srgb.astype(float).tolist(), "palette_srgb_8bit": _to_u8(palette_srgb).astype(int).tolist(),
+                    "config": asdict(self.config), "palette_working_rgb": self.palette_working.astype(float).tolist(),
+                    "palette_linear_rgb": self.palette_linear.astype(float).tolist(), "palette_srgb": self.palette_srgb.astype(float).tolist(),
+                    "outputs": {"asset_alpha_linear_k.png": {"rgb": "palette_srgb", "alpha": "clip(input_alpha * threshold_mask * k_linear, 0, 1)", "intended_compositing": "linear-light source-over"},
+                                "asset_alpha_srgb_k.png": {"rgb": "palette_srgb", "alpha": "clip(input_alpha * threshold_mask * k_srgb, 0, 1)", "intended_compositing": "encoded-srgb compatibility"},
+                                "reconstruction_original_alpha.png": {"rgb": "configured-working-space reconstruction with optional threshold fade", "alpha": "original input alpha for retained pixels; zero when excluded"}},
                     "statistics": _json_safe({**self.statistics, "source_bit_depth": self.source_bit_depth})}
         paths["palette"].write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
         return paths
@@ -131,7 +169,7 @@ def load_image(path: str | Path) -> tuple[np.ndarray, int]:
 
 
 def brightness_threshold_candidates(path: str | Path, config: ExtractorConfig,
-                                  top_percentages: tuple[int, ...] = tuple(range(10, 101, 10))) -> list[tuple[int, float]]:
+                                  top_percentages: tuple[int, ...] = (60, 45, 30, 20, 10, 8, 6, 5, 3, 1)) -> list[tuple[int, float]]:
     """Return B cutoffs whose retained pixels represent the requested brightest proportions."""
     rgba, _ = load_image(path)
     srgb, alpha = rgba[..., :3], rgba[..., 3]
@@ -153,9 +191,10 @@ def extract_brightness(image: str | Path | Image.Image | np.ndarray, color_count
     working = _srgb_to_linear(srgb) if cfg.working_space == "linear_rgb" else srgb
     brightness_source = srgb if cfg.brightness_space == "srgb" else working
     brightness = _pixel_brightness(brightness_source, cfg.brightness_metric)
-    soft_mask = np.clip(_smoothstep(cfg.threshold_low, cfg.threshold_high, brightness) * input_alpha, 0, 1).astype(np.float32)
-    pixels, flat_brightness, flat_mask = working.reshape(-1, 3), brightness.reshape(-1), soft_mask.reshape(-1)
-    norms = np.linalg.norm(pixels, axis=1); valid_indices = np.flatnonzero((flat_mask > 0) & (norms > 1e-12))
+    threshold_mask = _smoothstep(cfg.threshold_low, cfg.threshold_high, brightness)
+    effective_mask = (threshold_mask * input_alpha).astype(np.float32)
+    pixels, flat_brightness, flat_mask = working.reshape(-1, 3), brightness.reshape(-1), effective_mask.reshape(-1)
+    norms = np.linalg.norm(pixels, axis=1); valid_indices = np.flatnonzero((threshold_mask.reshape(-1) > 0) & (input_alpha.reshape(-1) > 0) & (norms > 1e-12))
     if not valid_indices.size: raise ValueError("No pixels survive the threshold. Lower threshold_low/threshold_high or check the input image.")
     if color_count > valid_indices.size: raise ValueError(f"color_count={color_count} exceeds the {valid_indices.size} retained pixels.")
     rng = np.random.default_rng(cfg.random_seed)
@@ -165,31 +204,39 @@ def extract_brightness(image: str | Path | Image.Image | np.ndarray, color_count
     weights = _fitting_weights(cfg, flat_mask[sample_indices].astype(np.float64), flat_brightness[sample_indices].astype(np.float64), sample_norms)
     _report(progress, "fit", .05)
     palette_units, objective, iterations, best_restart = _fit_k_lines(sample_directions, weights, color_count, cfg, rng, lambda done: _report(progress, "fit", done / cfg.restarts), cancel)
-    palette = np.clip(palette_units / np.max(palette_units, axis=1, keepdims=True), 0, 1).astype(np.float32)
-    labels_flat = np.full(pixels.shape[0], -1, dtype=np.int32); k_raw = np.zeros(pixels.shape[0], dtype=np.float32); _report(progress, "classify", 0)
+    palette_working = np.clip(palette_units / np.max(palette_units, axis=1, keepdims=True), 0, 1).astype(np.float32)
+    palette_srgb = _linear_to_srgb(palette_working) if cfg.working_space == "linear_rgb" else palette_working.copy()
+    palette_linear = palette_working.copy() if cfg.working_space == "linear_rgb" else _srgb_to_linear(palette_working)
+    labels_flat = np.full(pixels.shape[0], -1, dtype=np.int32)
+    k_linear_raw = np.zeros(pixels.shape[0], dtype=np.float32); k_srgb_raw = np.zeros(pixels.shape[0], dtype=np.float32); _report(progress, "classify", 0)
+    flat_srgb = srgb.reshape(-1, 3); flat_linear = _srgb_to_linear(srgb).reshape(-1, 3)
     for start in range(0, valid_indices.size, cfg.chunk_size):
         _check_cancel(cancel); end = min(start + cfg.chunk_size, valid_indices.size); idx = valid_indices[start:end]
         chunk = pixels[idx].astype(np.float64, copy=False); directions = chunk / np.linalg.norm(chunk, axis=1, keepdims=True)
-        chunk_labels = np.argmax((directions @ palette_units.T) ** 2, axis=1); labels_flat[idx] = chunk_labels
-        selected = palette[chunk_labels].astype(np.float64, copy=False)
-        k_raw[idx] = np.maximum(np.sum(chunk * selected, axis=1) / np.sum(selected * selected, axis=1), 0).astype(np.float32)
+        chunk_labels, _ = _best_labels_scores(directions, palette_units); labels_flat[idx] = chunk_labels
+        selected_linear = palette_linear[chunk_labels].astype(np.float64, copy=False)
+        selected_srgb = palette_srgb[chunk_labels].astype(np.float64, copy=False)
+        p_linear, p_srgb = flat_linear[idx], flat_srgb[idx]
+        k_linear_raw[idx] = np.maximum(np.sum(p_linear * selected_linear, axis=1) / np.sum(selected_linear * selected_linear, axis=1), 0).astype(np.float32)
+        k_srgb_raw[idx] = np.maximum(np.sum(p_srgb * selected_srgb, axis=1) / np.sum(selected_srgb * selected_srgb, axis=1), 0).astype(np.float32)
         _report(progress, "classify", end / valid_indices.size)
-    model_k = k_raw.copy(); over_one = int(np.count_nonzero(model_k[valid_indices] > 1))
-    if cfg.clamp_brightness: np.clip(model_k, 0, 1, out=model_k)
-    output_k = model_k * flat_mask if cfg.apply_soft_mask_to_output else model_k * input_alpha.reshape(-1) * (labels_flat >= 0)
-    if cfg.clamp_brightness: np.clip(output_k, 0, 1, out=output_k)
-    colors = np.zeros_like(pixels, dtype=np.float32); colors[valid_indices] = palette[labels_flat[valid_indices]]
-    raw_reconstruction = colors[valid_indices] * k_raw[valid_indices, None]; output_reconstruction = colors[valid_indices] * output_k[valid_indices, None]
-    original = pixels[valid_indices]; cluster_sizes = np.bincount(labels_flat[valid_indices], minlength=color_count).astype(int)
+    colors = np.zeros_like(pixels, dtype=np.float32); colors[valid_indices] = palette_working[labels_flat[valid_indices]]
+    reconstruction_working = colors[valid_indices] * (k_linear_raw[valid_indices, None] if cfg.working_space == "linear_rgb" else k_srgb_raw[valid_indices, None])
+    if cfg.apply_soft_mask_to_output: reconstruction_working *= threshold_mask.reshape(-1)[valid_indices, None]
+    cluster_sizes = np.bincount(labels_flat[valid_indices], minlength=color_count).astype(int)
     statistics = {"image_width": width, "image_height": height, "total_pixels": int(width * height), "retained_pixels": int(valid_indices.size),
                   "fit_sample_pixels": int(sample_indices.size), "cluster_pixel_counts": cluster_sizes.tolist(),
                   "cluster_pixel_fractions": (cluster_sizes / valid_indices.size).tolist(), "weighted_angular_fit_objective": float(objective),
-                  "raw_projection_mse_working_rgb": float(np.mean((original - raw_reconstruction) ** 2)),
-                  "saved_output_mse_working_rgb": float(np.mean((original - output_reconstruction) ** 2)), "raw_projection_values_over_one": over_one,
+                  "raw_projection_mse_linear_rgb": float(np.mean((flat_linear[valid_indices] - palette_linear[labels_flat[valid_indices]] * k_linear_raw[valid_indices, None]) ** 2)),
+                  "raw_projection_mse_srgb": float(np.mean((flat_srgb[valid_indices] - palette_srgb[labels_flat[valid_indices]] * k_srgb_raw[valid_indices, None]) ** 2)),
+                  "final_reconstruction_mse_working": float(np.mean((pixels[valid_indices] - reconstruction_working) ** 2)),
+                  "k_linear_over_one_count": int(np.count_nonzero(k_linear_raw[valid_indices] > 1)),
+                  "k_srgb_over_one_count": int(np.count_nonzero(k_srgb_raw[valid_indices] > 1)),
                   "best_restart_zero_based": int(best_restart), "best_restart_iterations": int(iterations),
                   "near_duplicate_palette_pairs_zero_based": _find_duplicate_palette_pairs(palette_units)}
     _report(progress, "done", 1)
-    return ExtractionResult(output_k.reshape(height, width).astype(np.float32), colors.reshape(height, width, 3), labels_flat.reshape(height, width), soft_mask, palette, cfg, statistics, source_bit_depth)
+    return ExtractionResult(palette_working, palette_linear, palette_srgb, labels_flat.reshape(height, width), threshold_mask.astype(np.float32), input_alpha.astype(np.float32),
+                            k_linear_raw.reshape(height, width), k_srgb_raw.reshape(height, width), colors.reshape(height, width, 3), cfg, statistics, source_bit_depth)
 
 
 def _fit_k_lines(directions, weights, color_count, config, rng, progress, cancel):
@@ -197,14 +244,14 @@ def _fit_k_lines(directions, weights, color_count, config, rng, progress, cancel
     for restart in range(config.restarts):
         _check_cancel(cancel); centers = _k_lines_plus_plus(directions, weights, color_count, rng); previous_labels, previous_objective = None, math.inf
         for iteration in range(1, config.max_iterations + 1):
-            _check_cancel(cancel); labels = np.argmax((directions @ centers.T) ** 2, axis=1); centers = _update_centers(directions, weights, labels, centers, rng)
-            residuals = np.maximum(1 - np.max((directions @ centers.T) ** 2, axis=1), 0); objective = float(np.sum(weights * residuals) / np.sum(weights))
+            _check_cancel(cancel); labels, scores = _best_labels_scores(directions, centers); centers = _update_centers(directions, weights, labels, centers, rng)
+            _, scores = _best_labels_scores(directions, centers); residuals = np.maximum(1 - scores, 0); objective = float(np.sum(weights * residuals) / np.sum(weights))
             unchanged = previous_labels is not None and np.array_equal(labels, previous_labels)
             relative = abs(previous_objective - objective) / max(abs(previous_objective), 1e-15) if math.isfinite(previous_objective) else math.inf
             previous_labels = labels
             if unchanged or (math.isfinite(previous_objective) and relative <= config.convergence_tolerance): break
             previous_objective = objective
-        residuals = np.maximum(1 - np.max((directions @ centers.T) ** 2, axis=1), 0); objective = float(np.sum(weights * residuals) / np.sum(weights))
+        _, scores = _best_labels_scores(directions, centers); residuals = np.maximum(1 - scores, 0); objective = float(np.sum(weights * residuals) / np.sum(weights))
         if objective < best_objective: best_centers, best_objective, best_iterations, best_restart = centers.copy(), objective, iteration, restart
         progress(restart + 1)
     if best_centers is None: raise RuntimeError("K-lines failed to produce a palette")
@@ -232,7 +279,8 @@ def _update_centers(directions, weights, labels, old, rng):
         if np.sum(vector) < 0: vector = -vector
         vector = np.maximum(vector, 0); norm = np.linalg.norm(vector); updated[cluster] = vector / norm if norm > 1e-15 else old[cluster]
     if empty:
-        candidate = weights * np.maximum(1 - np.max((directions @ old.T) ** 2, axis=1), 0); used = set()
+        _, best_scores = _best_labels_scores(directions, old)
+        candidate = weights * np.maximum(1 - best_scores, 0); used = set()
         for cluster in empty:
             available = candidate.copy()
             if used: available[np.fromiter(used, dtype=np.int64)] = -1
@@ -241,6 +289,20 @@ def _update_centers(directions, weights, labels, old, rng):
                 choices = np.array([i for i in range(directions.shape[0]) if i not in used]); chosen = int(rng.choice(choices)) if choices.size else int(rng.integers(directions.shape[0]))
             updated[cluster] = directions[chosen]; used.add(chosen)
     return updated
+
+
+def _best_labels_scores(directions: np.ndarray, centers: np.ndarray, center_block_size: int = 32) -> tuple[np.ndarray, np.ndarray]:
+    """Classify without ever allocating a pixel-count × palette-count matrix."""
+    labels = np.zeros(directions.shape[0], dtype=np.int32)
+    scores = np.full(directions.shape[0], -np.inf, dtype=np.float64)
+    for start in range(0, centers.shape[0], center_block_size):
+        block_scores = (directions @ centers[start:start + center_block_size].T) ** 2
+        local_labels = np.argmax(block_scores, axis=1)
+        local_scores = block_scores[np.arange(block_scores.shape[0]), local_labels]
+        better = local_scores > scores
+        scores[better] = local_scores[better]
+        labels[better] = start + local_labels[better]
+    return labels, scores
 
 
 def _load_image(image):
@@ -272,7 +334,7 @@ def _orient_array(array, orientation):
     if orientation == 4: return np.flipud(array)
     if orientation == 5: return np.swapaxes(array, 0, 1)
     if orientation == 6: return np.rot90(array, 3)
-    if orientation == 7: return np.fliplr(np.swapaxes(array, 0, 1))
+    if orientation == 7: return np.flipud(np.fliplr(np.swapaxes(array, 0, 1)))
     if orientation == 8: return np.rot90(array)
     return array
 
@@ -297,7 +359,7 @@ def _srgb_to_linear(value):
     value = np.asarray(value, dtype=np.float32); return np.where(value <= .04045, value / 12.92, np.power((value + .055) / 1.055, 2.4)).astype(np.float32)
 def _linear_to_srgb(value):
     value = np.clip(np.asarray(value, dtype=np.float32), 0, 1); return np.where(value <= .0031308, 12.92 * value, 1.055 * np.power(value, 1 / 2.4) - .055).astype(np.float32)
-def _save_gray16(path, value): Image.fromarray(np.round(np.clip(value, 0, 1) * 65535).astype(np.uint16), mode="I;16").save(path)
+def _save_gray16(path, value): Image.fromarray(np.round(np.clip(value, 0, 1) * 65535).astype(np.uint16)).save(path)
 def _to_u8(value): return np.round(np.clip(value, 0, 1) * 255).astype(np.uint8)
 def _find_duplicate_palette_pairs(palette, cosine_threshold=.99999): return [[a, b] for a in range(palette.shape[0]) for b in range(a + 1, palette.shape[0]) if float(np.dot(palette[a], palette[b])) >= cosine_threshold]
 def _check_cancel(cancel):

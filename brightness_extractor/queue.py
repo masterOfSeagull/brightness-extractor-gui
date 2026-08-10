@@ -81,7 +81,7 @@ class BatchQueue:
             try:
                 image, bit_depth = load_image(item.path)
                 result = extract_brightness(image, item.color_count, item.config,
-                    progress=lambda _stage, value: self._item_progress(item, value, index, notify),
+                    progress=lambda stage, value: self._item_progress(item, stage, value, index, notify),
                     cancel=cancel.is_set, source_bit_depth=bit_depth)
                 source_folder = re.sub(r"[^\w.-]+", "_", item.path.stem, flags=re.UNICODE).strip("._") or "image"
                 image_root = root / source_folder
@@ -96,8 +96,9 @@ class BatchQueue:
                 while item.result_dir.exists():
                     item.result_dir = image_root / f"{timestamp}-{suffix}"
                     suffix += 1
+                self._item_progress(item, "save", 0, index, notify)
                 saved = result.save(item.result_dir, item.path)
-                item.result_preview = saved["reconstruction_green"]
+                item.result_preview = saved["reconstruction_original_alpha"]
                 item.status, item.progress = "완료", 1.0
             except ExtractionCancelled:
                 item.status = "취소됨"
@@ -111,7 +112,9 @@ class BatchQueue:
         return root
 
     @staticmethod
-    def _item_progress(item: QueueItem, value: float, index: int, notify: Callable[[int, QueueItem], None] | None) -> None:
-        item.progress = value
+    def _item_progress(item: QueueItem, stage: str, value: float, index: int, notify: Callable[[int, QueueItem], None] | None) -> None:
+        ranges = {"load": (0.0, .05), "fit": (.05, .70), "classify": (.70, .92), "done": (.92, .97), "save": (.97, 1.0)}
+        start, end = ranges.get(stage, (0.0, 1.0))
+        item.progress = max(item.progress, start + (end - start) * value)
         if notify:
             notify(index, item)

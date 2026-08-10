@@ -5,7 +5,7 @@ from pathlib import Path
 
 from .core import ExtractorConfig
 
-PRESET_VERSION = 1
+PRESET_VERSION = 2
 
 
 def save_preset(path: str | Path, color_count: int, config: ExtractorConfig) -> None:
@@ -23,7 +23,7 @@ def load_preset(path: str | Path) -> tuple[int, ExtractorConfig]:
         raise ValueError("사전 설정 파일을 읽을 수 없습니다.") from error
     if not isinstance(data, dict) or data.get("format") != "brightness-extractor-preset":
         raise ValueError("올바른 밝기 추출 사전 설정이 아닙니다.")
-    if data.get("version") != PRESET_VERSION:
+    if data.get("version") not in (1, PRESET_VERSION):
         raise ValueError("지원하지 않는 사전 설정 버전입니다.")
     color_count = data.get("color_count")
     if not isinstance(color_count, int) or color_count < 1:

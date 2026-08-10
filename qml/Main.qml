@@ -49,15 +49,66 @@ ApplicationWindow {
         id: zoomView
         property url imageSource: ""
         property real zoom: 1
+        readonly property real minimumZoom: 0.5
+        readonly property real maximumZoom: 128
+        readonly property real fittedImageWidth: previewImage.sourceSize.width > 0 && previewImage.sourceSize.height > 0
+                                                ? Math.min(width, height * previewImage.sourceSize.width / previewImage.sourceSize.height)
+                                                : width
+        readonly property real fittedImageHeight: previewImage.sourceSize.width > 0 && previewImage.sourceSize.height > 0
+                                                 ? Math.min(height, width * previewImage.sourceSize.height / previewImage.sourceSize.width)
+                                                 : height
         clip: true
         boundsBehavior: Flickable.StopAtBounds
-        contentWidth: width * zoom
-        contentHeight: height * zoom
-        Image { width: zoomView.contentWidth; height: zoomView.contentHeight; source: zoomView.imageSource; fillMode: Image.PreserveAspectFit }
+        contentWidth: Math.max(width, previewImage.width)
+        contentHeight: Math.max(height, previewImage.height)
+        Canvas {
+            width: zoomView.contentWidth; height: zoomView.contentHeight
+            onWidthChanged: requestPaint(); onHeightChanged: requestPaint()
+            onPaint: {
+                var context = getContext("2d"), size = 14
+                context.fillStyle = "#eee7dd"; context.fillRect(0, 0, width, height)
+                context.fillStyle = "#d8cec3"
+                for (var y = 0; y < height; y += size)
+                    for (var x = (Math.floor(y / size) % 2) * size; x < width; x += size * 2)
+                        context.fillRect(x, y, size, size)
+            }
+        }
+        function limit(value, low, high) { return Math.max(low, Math.min(high, value)) }
+        function setZoomAt(factor, pointerX, pointerY) {
+            var oldWidth = previewImage.width
+            var oldHeight = previewImage.height
+            var relativeX = oldWidth > 0 ? limit((contentX + pointerX - previewImage.x) / oldWidth, 0, 1) : 0.5
+            var relativeY = oldHeight > 0 ? limit((contentY + pointerY - previewImage.y) / oldHeight, 0, 1) : 0.5
+            zoom = limit(zoom * factor, minimumZoom, maximumZoom)
+            var targetX = relativeX * previewImage.width + previewImage.x - pointerX
+            var targetY = relativeY * previewImage.height + previewImage.y - pointerY
+            contentX = limit(targetX, 0, Math.max(0, contentWidth - width))
+            contentY = limit(targetY, 0, Math.max(0, contentHeight - height))
+        }
+        Image {
+            id: previewImage
+            x: (zoomView.contentWidth - width) / 2
+            y: (zoomView.contentHeight - height) / 2
+            width: Math.max(1, zoomView.fittedImageWidth * zoomView.zoom)
+            height: Math.max(1, zoomView.fittedImageHeight * zoomView.zoom)
+            source: zoomView.imageSource
+            fillMode: Image.Stretch
+            smooth: zoomView.zoom < 8
+            mipmap: false
+            antialiasing: false
+        }
         WheelHandler {
             acceptedModifiers: Qt.ControlModifier
             onWheel: function(wheel) {
-                zoomView.zoom = Math.max(0.5, Math.min(8, zoomView.zoom * (wheel.angleDelta.y > 0 ? 1.15 : 1 / 1.15)))
+                var pointerX = zoomView.width / 2
+                var pointerY = zoomView.height / 2
+                if (wheel.x !== undefined && wheel.y !== undefined) {
+                    pointerX = wheel.x
+                    pointerY = wheel.y
+                }
+                var delta = wheel.angleDelta.y
+                if (delta !== 0)
+                    zoomView.setZoomAt(Math.pow(1.2, delta / 120), pointerX, pointerY)
                 wheel.accepted = true
             }
         }
@@ -75,6 +126,13 @@ ApplicationWindow {
     font.family: pretendard.name
 
     function syncSettings() { setting = backend.selectedSettings }
+    function brightnessSpaceLabel() {
+        if (setting.brightness_space === "srgb") return "sRGB"
+        return setting.working_space === "linear_rgb" ? "Linear RGB 작업 색공간" : "sRGB 작업 색공간"
+    }
+    function brightnessMetricLabel() {
+        return setting.brightness_metric === "luminance" ? "상대 휘도" : "max(R,G,B)"
+    }
     Connections {
         target: backend
         function onSelectedChanged() { root.syncSettings(); inputPreviewImage.zoom = 1; reconstructionPreviewImage.zoom = 1 }
@@ -328,16 +386,16 @@ ApplicationWindow {
                                     }
                                 }
                                 RowLayout { Layout.fillWidth: true; Layout.preferredHeight: 24; spacing: 14
-                                    CompactCheckBox { text: "부드러운 마스크 적용"; checked: root.setting.apply_soft_mask_to_output; onToggled: { root.setting.apply_soft_mask_to_output = checked; backend.updateSelected(root.setting) } }
-                                    CompactCheckBox { text: "밝기 0–1 제한"; checked: root.setting.clamp_brightness; onToggled: { root.setting.clamp_brightness = checked; backend.updateSelected(root.setting) } }
+                                    CompactCheckBox { text: "출력에 임계값 페이드 적용"; checked: root.setting.apply_soft_mask_to_output; onToggled: { root.setting.apply_soft_mask_to_output = checked; backend.updateSelected(root.setting) } }
+                                    Label { text: "PNG 알파는 항상 0~1로 안전하게 저장됩니다."; color: root.muted; font.pixelSize: 9 }
                                 }
                             }
                         }
                         Rectangle { Layout.fillWidth: true; Layout.fillHeight: true; Layout.preferredHeight: settingsAdvancedLayout.columns === 1 ? 230 : -1; color: "#e3d8ca"; radius: 5
                             ColumnLayout { anchors.fill: parent; anchors.margins: 13; spacing: 6
                                 Label { text: "내부 동작 · 현재 기본값 기준"; color: root.ink; font.family: pretendardMedium.name; font.pixelSize: 12 }
-                                Label { Layout.fillWidth: true; text: "1. 밝기 B를 구합니다. 기본값은 sRGB의 B = max(R, G, B)입니다. (luminance를 고르면 0.2126R + 0.7152G + 0.0722B를 사용합니다.)"; color: root.ink; font.pixelSize: 11; wrapMode: Text.WordWrap; lineHeight: 1.18 }
-                                Label { Layout.fillWidth: true; text: "2. 입력 알파 A는 원본 값을 그대로 씁니다. RGB 입력은 모든 픽셀이 A = 1, RGBA 입력은 0~1의 원래 투명도를 유지합니다. 즉 입력 투명도는 0/1 이진 판정이 아닙니다. 마스크는 M = smoothstep(하한, 상한, B) × A이며, A = 0인 픽셀은 제외됩니다. 저장되는 asset_rgba의 알파는 0/1이 아니라 최종 밝기 k(마스크 적용 시 k × M)이고, main_color의 알파만 색상 레이블이 있는 픽셀은 1, 제외된 픽셀은 0입니다."; color: root.ink; font.pixelSize: 11; wrapMode: Text.WordWrap; lineHeight: 1.18 }
+                                Label { Layout.fillWidth: true; text: "1. 밝기 B를 구합니다. ‘측정 색공간’이 sRGB이면 원본 sRGB에서, working이면 작업 색공간에서 계산합니다. 작업 색공간이 linear_rgb이면 먼저 Linear RGB로 변환합니다. 기본값은 sRGB의 B = max(R, G, B)이며, luminance는 0.2126R + 0.7152G + 0.0722B입니다. 아래 후보 표도 이 현재 설정을 그대로 씁니다."; color: root.ink; font.pixelSize: 11; wrapMode: Text.WordWrap; lineHeight: 1.18 }
+                                Label { Layout.fillWidth: true; text: "2. T = smoothstep(하한, 상한, B)는 임계값 마스크이고, A는 원본 알파입니다(RGB 입력은 A = 1). 유효 픽셀은 T > 0, A > 0, RGB 크기 > 0을 모두 만족합니다. 두 알파 자산은 A × T × k를, 재구성 이미지는 A를 그대로 알파로 쓰고 밝기는 RGB에 구워 넣습니다."; color: root.ink; font.pixelSize: 11; wrapMode: Text.WordWrap; lineHeight: 1.18 }
                                 Label { Layout.fillWidth: true; text: "3. atmosphere 맞춤의 실제 가중치는 W = M × [F + (1 − F) × B^P]입니다. F는 가중치 바닥, P는 가중치 지수입니다. 0 < B < 1에서 P가 작을수록 어두운·중간 픽셀의 비중이 커지고, P가 클수록 밝은 픽셀 쪽으로 더 기웁니다."; color: root.ink; font.pixelSize: 11; wrapMode: Text.WordWrap; lineHeight: 1.18 }
                                 Label { Layout.fillWidth: true; text: "4. 유지된 RGB를 작업 색공간에서 단위 방향으로 정규화해 K-lines로 색상 레이를 찾습니다. 각 픽셀은 가장 가까운 레이를 고르고, 밝기 계수 k = dot(pixel, ray) / dot(ray, ray)로 투영합니다. 마스크 적용을 켜면 저장 밝기는 k × M입니다."; color: root.ink; font.pixelSize: 11; wrapMode: Text.WordWrap; lineHeight: 1.18 }
                                 Label { Layout.fillWidth: true; text: "참고: equal_hue는 W = M, rgb_mse는 W = M × ||RGB||²입니다. 0–1 제한은 k와 저장값을 잘라 PNG 범위 안에 둡니다."; color: root.muted; font.pixelSize: 11; wrapMode: Text.WordWrap; lineHeight: 1.15 }
@@ -351,11 +409,11 @@ ApplicationWindow {
                             RowLayout { Layout.fillWidth: true
                                 Label { text: "입력 미리보기"; color: root.ink; font.family: pretendardMedium.name; font.pixelSize: 12 }
                                 Item { Layout.fillWidth: true }
-                                Label { text: "Ctrl + 스크롤: 확대/축소"; color: root.muted; font.pixelSize: 9 }
+                                Label { text: "Ctrl + 스크롤: 포인터 기준 확대/축소 · 최대 128×"; color: root.muted; font.pixelSize: 9 }
                             }
                             ZoomableImage { id: inputPreviewImage; Layout.fillWidth: true; Layout.fillHeight: true; imageSource: backend.selectedIndex >= 0 ? "file:///" + backend.items[backend.selectedIndex].path : "" }
                             Rectangle { id: brightnessCandidateTable; Layout.fillWidth: true; Layout.preferredHeight: visible ? candidateGrid.implicitHeight + 35 : 0; visible: backend.selectedBrightnessCandidates.length > 0; color: "#f3ece3"; radius: 4; border.color: root.line
-                                Label { anchors.left: parent.left; anchors.leftMargin: 8; anchors.top: parent.top; anchors.topMargin: 6; text: "상위 밝기 비율 → B 절단값 (하한 후보)"; color: root.muted; font.pixelSize: 9 }
+                                Label { anchors.left: parent.left; anchors.right: parent.right; anchors.leftMargin: 8; anchors.rightMargin: 8; anchors.top: parent.top; anchors.topMargin: 6; text: "상위 밝기 비율 → B 절단값 (하한 후보 · 현재 " + root.brightnessSpaceLabel() + " / " + root.brightnessMetricLabel() + ")"; elide: Text.ElideRight; color: root.muted; font.pixelSize: 9 }
                                 GridLayout { id: candidateGrid; anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom; anchors.margins: 6; columns: brightnessCandidateTable.width > 500 ? 5 : 3; rowSpacing: 4; columnSpacing: 4
                                     Repeater { model: backend.selectedBrightnessCandidates
                                         delegate: Rectangle { required property var modelData; implicitWidth: 76; implicitHeight: 27; color: "#fffaf2"; radius: 3
@@ -374,7 +432,7 @@ ApplicationWindow {
                             RowLayout { Layout.fillWidth: true
                                 Label { text: "재구성 결과"; color: root.ink; font.family: pretendardMedium.name; font.pixelSize: 12 }
                                 Item { Layout.fillWidth: true }
-                                Label { text: "Ctrl + 스크롤: 확대/축소"; color: root.muted; font.pixelSize: 9 }
+                                Label { text: "Ctrl + 스크롤: 포인터 기준 확대/축소 · 최대 128×"; color: root.muted; font.pixelSize: 9 }
                             }
                             ZoomableImage { id: reconstructionPreviewImage; Layout.fillWidth: true; Layout.fillHeight: true; imageSource: backend.selectedIndex >= 0 && backend.items[backend.selectedIndex].resultPreview.length ? "file:///" + backend.items[backend.selectedIndex].resultPreview : "" }
                         }

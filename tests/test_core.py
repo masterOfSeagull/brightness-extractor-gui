@@ -18,7 +18,7 @@ def test_defaults_match_the_supplied_extractor_configuration():
     assert ExtractorConfig() == ExtractorConfig(
         threshold_low=.04, threshold_high=.14, brightness_metric="max", brightness_space="srgb",
         working_space="linear_rgb", fit_mode="atmosphere", atmosphere_weight_floor=.20,
-        atmosphere_weight_power=.50, apply_soft_mask_to_output=True, clamp_brightness=True,
+        atmosphere_weight_power=.50, apply_soft_mask_to_output=True,
         restarts=16, max_iterations=100, convergence_tolerance=1e-7, random_seed=7,
         fit_sample_limit=250_000, chunk_size=500_000,
     )
@@ -34,29 +34,36 @@ def test_exact_color_rays_reconstruct_and_palette_are_consistent(tmp_path):
     source = tmp_path / "synthetic.png"
     Image.fromarray(np.round(image * 255).astype(np.uint8), mode="RGB").save(source)
     folder = save_result_bundle(result, tmp_path / "bundle", source, 3, ExtractorConfig())
-    assert {"original.png", "brightness.png", "main_color.png", "labels.png", "soft_mask.png", "asset_rgba.png", "reconstruction_green.png", "palette.json"} <= {p.name for p in folder.iterdir()}
+    assert {"original.png", "main_color.png", "labels.png", "threshold_mask.png", "input_alpha.png", "brightness_k_linear.png", "brightness_k_srgb.png", "asset_alpha_linear_k.png", "asset_alpha_srgb_k.png", "reconstruction_original_alpha.png", "palette.json"} <= {p.name for p in folder.iterdir()}
     palette = json.loads((folder / "palette.json").read_text(encoding="utf-8"))
     assert len(palette["palette_srgb"]) == 3
 
 
-def test_green_screen_reconstruction_marks_excluded_pixels_green(tmp_path):
-    image = np.array([[[1, 0, 0], [.01, .01, .01]]], dtype=np.float32)
+def test_version_three_exports_keep_input_alpha_separate_from_threshold_and_assets(tmp_path):
+    image = np.array([[[1, 0, 0, .5], [.01, .01, .01, 1]]], dtype=np.float32)
     config = ExtractorConfig(threshold_low=.02, threshold_high=.03, restarts=1, max_iterations=10)
     result = extract_brightness(image, 1, config)
     source = tmp_path / "input.png"
     Image.fromarray(np.round(image * 255).astype(np.uint8), mode="RGB").save(source)
     saved = result.save(tmp_path / "bundle", source)
-    green_screen = np.asarray(Image.open(saved["reconstruction_green"]).convert("RGB"))
-    assert green_screen[0, 1].tolist() == [0, 255, 0]
+    reconstruction = np.asarray(Image.open(saved["reconstruction_original_alpha"]).convert("RGBA"))
+    input_alpha = np.asarray(Image.open(saved["input_alpha"]))
+    threshold = np.asarray(Image.open(saved["threshold_mask"]))
+    assert reconstruction[0, 0, 3] in range(126, 130)
+    assert reconstruction[0, 1].tolist() == [0, 0, 0, 0]
+    assert input_alpha[0, 0] in range(32760, 32780)
+    assert threshold[0, 0] == 65535
+    assert not (tmp_path / "bundle" / "reconstruction_green.png").exists()
 
 
-def test_brightness_threshold_candidates_cover_each_top_ten_percent(tmp_path):
+def test_brightness_threshold_candidates_use_the_requested_percentages_and_color_space(tmp_path):
     source = tmp_path / "gradient.png"
     Image.fromarray(np.array([[[0, 0, 0], [64, 64, 64], [128, 128, 128], [255, 255, 255]]], dtype=np.uint8)).save(source)
     candidates = dict(brightness_threshold_candidates(source, ExtractorConfig(working_space="srgb", brightness_space="srgb", brightness_metric="max")))
-    assert list(candidates) == list(range(10, 101, 10))
-    assert all(candidates[left] >= candidates[right] for left, right in zip(range(10, 100, 10), range(20, 101, 10)))
-    assert candidates[100] == pytest.approx(0)
+    linear_candidates = dict(brightness_threshold_candidates(source, ExtractorConfig(working_space="linear_rgb", brightness_space="working", brightness_metric="max")))
+    assert list(candidates) == [60, 45, 30, 20, 10, 8, 6, 5, 3, 1]
+    assert all(candidates[left] <= candidates[right] for left, right in zip([60, 45, 30, 20, 10, 8, 6, 5, 3], [45, 30, 20, 10, 8, 6, 5, 3, 1]))
+    assert linear_candidates[10] < candidates[10]
 
 
 def test_alpha_and_threshold_pixels_are_excluded():

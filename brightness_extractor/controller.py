@@ -184,6 +184,8 @@ class AppController(QObject):
             self.message.emit("N은 1에서 65,534 사이여야 합니다.")
             return
         self.queue.items[index].color_count = count
+        if count > 64:
+            self.message.emit("N이 64를 넘으면 처리 시간과 메모리 사용량이 크게 늘어납니다.")
         self._persist_first(); self.queueChanged.emit(); self.selectedChanged.emit()
 
     @Slot("QVariantMap")
@@ -198,6 +200,8 @@ class AppController(QObject):
             self.queue.items[self._selected].color_count, self.queue.items[self._selected].config = count, config
         else:
             self.queue.seed_count, self.queue.seed_config = count, config
+        if count > 64:
+            self.message.emit("N이 64를 넘으면 처리 시간과 메모리 사용량이 크게 늘어납니다.")
         self._persist_first(); self.queueChanged.emit(); self.selectedChanged.emit()
 
     @Slot(str)

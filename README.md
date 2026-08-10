@@ -1,15 +1,23 @@
 # Brightness Extractor GUI
 
-RGB/RGBA 래스터 이미지를 K-lines 색상 레이와 밝기 계수로 분해하는 한국어 PySide6/QML 데스크톱 도구입니다.
+PySide6/QML batch application that fits one weighted K-lines palette and label map per image.
 
-## 실행
+## Run and test
 
-`run.bat`을 실행하면 프로젝트 전용 가상 환경을 만들고 필요한 패키지를 설치한 뒤 앱을 시작합니다.
-
-## 테스트
+`run.bat` creates the project virtual environment and starts the app. Run tests with:
 
 ```powershell
 .\.venv\Scripts\python -m pytest
 ```
 
-결과는 `출력 루트/원본파일명(확장자 제외)/실행시각/`에 저장됩니다. 각 실행 폴더에는 원본 복사본 `original.<확장자>`, `asset_rgba.png`, `brightness.png`, `main_color.png`, `labels.png`, `soft_mask.png`, 녹색 배경의 `reconstruction_green.png`, `palette.json`이 포함됩니다.
+## Version-3 output bundle
+
+Each run is stored under `output root/original name/timestamp/` and contains the original copy, `main_color.png`, `labels.png`, `threshold_mask.png`, `input_alpha.png`, `brightness_k_linear.png`, `brightness_k_srgb.png`, `asset_alpha_linear_k.png`, `asset_alpha_srgb_k.png`, `reconstruction_original_alpha.png`, and `palette.json`.
+
+Input RGB is assumed to be straight/unassociated sRGB. RGB files use input alpha `A = 1`; RGBA files retain their original alpha. `T` is the threshold-only mask. One fitted palette and label map produce both projection coefficients: `k_l` in Linear RGB and `k_s` in sRGB.
+
+- `asset_alpha_linear_k.png`: palette RGB plus `clip(A * T * k_l)` alpha for linear-light compositing.
+- `asset_alpha_srgb_k.png`: palette RGB plus `clip(A * T * k_s)` alpha for encoded-sRGB multiplication compatibility.
+- `reconstruction_original_alpha.png`: fitted brightness is baked into RGB; alpha is the retained original `A`.
+
+The metadata records the exact formulas, palette representations, and unclamped-coefficient statistics. `main_color.png` is a categorical palette/label map, not a compositing asset.
