@@ -49,6 +49,8 @@ ApplicationWindow {
         id: zoomView
         property url imageSource: ""
         property real zoom: 1
+        property real smallImageX: 0
+        property real smallImageY: 0
         readonly property real minimumZoom: 0.5
         readonly property real maximumZoom: 128
         readonly property real fittedImageWidth: previewImage.sourceSize.width > 0 && previewImage.sourceSize.height > 0
@@ -82,13 +84,23 @@ ApplicationWindow {
             zoom = limit(zoom * factor, minimumZoom, maximumZoom)
             var targetX = relativeX * previewImage.width + previewImage.x - pointerX
             var targetY = relativeY * previewImage.height + previewImage.y - pointerY
-            contentX = limit(targetX, 0, Math.max(0, contentWidth - width))
-            contentY = limit(targetY, 0, Math.max(0, contentHeight - height))
+            if (previewImage.width <= width) {
+                smallImageX = limit(pointerX - relativeX * previewImage.width, 0, width - previewImage.width)
+                contentX = 0
+            } else {
+                contentX = limit(targetX, 0, Math.max(0, contentWidth - width))
+            }
+            if (previewImage.height <= height) {
+                smallImageY = limit(pointerY - relativeY * previewImage.height, 0, height - previewImage.height)
+                contentY = 0
+            } else {
+                contentY = limit(targetY, 0, Math.max(0, contentHeight - height))
+            }
         }
         Image {
             id: previewImage
-            x: (zoomView.contentWidth - width) / 2
-            y: (zoomView.contentHeight - height) / 2
+            x: width <= zoomView.width ? (zoomView.zoom === 1 ? (zoomView.width - width) / 2 : zoomView.smallImageX) : 0
+            y: height <= zoomView.height ? (zoomView.zoom === 1 ? (zoomView.height - height) / 2 : zoomView.smallImageY) : 0
             width: Math.max(1, zoomView.fittedImageWidth * zoomView.zoom)
             height: Math.max(1, zoomView.fittedImageHeight * zoomView.zoom)
             source: zoomView.imageSource
@@ -96,12 +108,18 @@ ApplicationWindow {
             smooth: zoomView.zoom < 8
             mipmap: false
             antialiasing: false
+            onStatusChanged: if (status === Image.Ready && zoomView.zoom === 1) {
+                zoomView.smallImageX = Math.max(0, (zoomView.width - width) / 2)
+                zoomView.smallImageY = Math.max(0, (zoomView.height - height) / 2)
+            }
         }
         WheelHandler {
             acceptedModifiers: Qt.ControlModifier
             onWheel: function(wheel) {
                 var pointerX = zoomView.width / 2
                 var pointerY = zoomView.height / 2
+                // Qt 6 WheelHandler reports coordinates in the handler's local
+                // space, exactly the coordinate system used by contentX/Y.
                 if (wheel.x !== undefined && wheel.y !== undefined) {
                     pointerX = wheel.x
                     pointerY = wheel.y
@@ -146,11 +164,11 @@ ApplicationWindow {
         nameFilters: ["이미지 파일 (*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff)", "모든 파일 (*)"]
         onAccepted: backend.addFiles(selectedFiles)
     }
-    FolderDialog { id: folderDialog; title: "출력 루트 선택"; onAccepted: backend.setOutputRoot(selectedFolder.toLocalFile()) }
+    FolderDialog { id: folderDialog; title: "출력 루트 선택"; onAccepted: backend.setOutputRoot(selectedFolder) }
     FileDialog { id: savePresetDialog; title: "사전 설정 저장"; fileMode: FileDialog.SaveFile; defaultSuffix: "json"; nameFilters: ["JSON (*.json)"]
-        onAccepted: backend.savePreset(selectedFile.toLocalFile()) }
+        onAccepted: backend.savePreset(selectedFile) }
     FileDialog { id: loadPresetDialog; title: "사전 설정 불러오기"; fileMode: FileDialog.OpenFile; nameFilters: ["JSON (*.json)"]
-        onAccepted: backend.loadPreset(selectedFile.toLocalFile()) }
+        onAccepted: backend.loadPreset(selectedFile) }
     Popup { id: criticalErrorDialog
         parent: Overlay.overlay
         anchors.centerIn: parent
@@ -225,6 +243,10 @@ ApplicationWindow {
             Label { text: "BRIGHTNESS EXTRACTOR"; font.family: pretendardMedium.name; font.letterSpacing: 1.2; color: root.cream; font.pixelSize: 13 }
             Item { Layout.fillWidth: true }
             Label { text: "K-LINES / RGB RAYS"; color: "#b5aaa1"; font.pixelSize: 11; font.letterSpacing: 1 }
+            ToolButton { id: fullScreenButton; Layout.preferredWidth: 40; Layout.preferredHeight: 40; hoverEnabled: true; onClicked: root.visibility === Window.FullScreen ? root.showNormal() : root.showFullScreen()
+                background: Rectangle { color: fullScreenButton.hovered ? "#4a4542" : "transparent"; radius: 3 }
+                contentItem: Label { anchors.fill: parent; text: root.visibility === Window.FullScreen ? "❐" : "□"; color: root.cream; font.pixelSize: 19; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+            }
             ToolButton { id: minimizeButton; Layout.preferredWidth: 40; Layout.preferredHeight: 40; hoverEnabled: true; onClicked: root.showMinimized()
                 background: Rectangle { color: minimizeButton.hovered ? "#4a4542" : "transparent"; radius: 3 }
                 contentItem: Item { Rectangle { anchors.centerIn: parent; anchors.verticalCenterOffset: 1; width: 12; height: 1; color: root.cream } }
@@ -262,6 +284,7 @@ ApplicationWindow {
                 }
                 Rectangle { Layout.fillWidth: true; Layout.fillHeight: true; color: "#272424"; radius: 5; border.color: "#49413e"; border.width: 1
                     ListView { id: queueList; anchors.fill: parent; anchors.margins: 6; model: backend.items; clip: true; spacing: 5
+                        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AlwaysOn }
                         delegate: Rectangle { required property var modelData; required property int index
                             width: queueList.width; height: 86; radius: 4; color: backend.selectedIndex === index ? "#513a3b" : "#383332"
                             border.color: backend.selectedIndex === index ? "#c78383" : "transparent"
@@ -283,7 +306,7 @@ ApplicationWindow {
                                     Label { text: "색상 수 N"; color: "#b9afa8"; font.pixelSize: 9 }
                                     TextField { id: rowN; text: String(modelData.n); width: 56; height: 32; enabled: !backend.running; selectByMouse: true
                                         color: "#ffffff"; font.family: pretendardBold.name; font.pixelSize: 14; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter
-                                        validator: IntValidator { bottom: 1; top: 65534 }
+                                        validator: IntValidator { bottom: 1; top: 256 }
                                         inputMethodHints: Qt.ImhFormattedNumbersOnly
                                         onEditingFinished: backend.setColorCount(index, parseInt(text))
                                         background: Rectangle { radius: 3; color: "#292423"; border.color: rowN.activeFocus ? "#c78383" : "#736661" }
@@ -307,9 +330,9 @@ ApplicationWindow {
         }
 
         Rectangle { Layout.fillWidth: true; Layout.fillHeight: true; color: root.cream
-            ScrollView { id: settingsScroll; anchors.fill: parent; clip: true
+            ScrollView { id: settingsScroll; anchors.fill: parent; anchors.bottomMargin: 60; clip: true
                 contentWidth: availableWidth
-                ScrollBar.vertical.policy: ScrollBar.AsNeeded
+                ScrollBar.vertical.policy: ScrollBar.AlwaysOn
                 ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
                 Item { id: settingsContent; width: settingsScroll.availableWidth; height: settingsColumn.implicitHeight + 52
             ColumnLayout { id: settingsColumn; x: 26; y: 26; width: parent.width - 52; spacing: 16
@@ -438,15 +461,17 @@ ApplicationWindow {
                         }
                     }
                 }
-                RowLayout { Layout.fillWidth: true
+            }
+                }
+            }
+            Rectangle { id: processingDock; anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom; height: 60; color: "#eee7de"; border.color: root.line; border.width: 1
+                RowLayout { anchors.fill: parent; anchors.leftMargin: 26; anchors.rightMargin: 26
                     Button { text: "결과 폴더 열기"; enabled: backend.selectedIndex >= 0 && backend.items[backend.selectedIndex].resultDir.length > 0; onClicked: backend.openSelectedResult() }
                     Item { Layout.fillWidth: true }
                     Button { text: backend.running ? "처리 취소" : "대기열 추출 시작"; Layout.preferredWidth: 210; onClicked: backend.running ? backend.cancel() : backend.runQueue()
                         background: Rectangle { color: parent.enabled ? root.burgundy : "#b7ada5"; radius: 4 }
                         contentItem: Label { text: parent.text; color: "white"; font.family: pretendardBold.name; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                     }
-                }
-            }
                 }
             }
         }

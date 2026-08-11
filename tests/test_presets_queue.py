@@ -20,6 +20,15 @@ def test_preset_round_trip_and_bad_values_do_not_load(tmp_path):
     with pytest.raises(ValueError): load_preset(path)
 
 
+def test_presets_reject_palette_counts_above_the_operational_limit(tmp_path):
+    path = tmp_path / "too-many.json"
+    with pytest.raises(ValueError, match="256"):
+        save_preset(path, 257, ExtractorConfig())
+    path.write_text('{"format":"brightness-extractor-preset", "version":2, "color_count":257, "config":{}}', encoding="utf-8")
+    with pytest.raises(ValueError, match="256"):
+        load_preset(path)
+
+
 def test_first_item_is_seeded_and_later_items_clone_first_current_config(tmp_path):
     paths = [tmp_path / "one.png", tmp_path / "two.png", tmp_path / "three.png"]
     queue = BatchQueue(ExtractorConfig(threshold_low=.11), 4)

@@ -2,11 +2,12 @@ import json
 
 import numpy as np
 import pytest
-from PIL import Image
+from PIL import Image, ImageCms
 import cv2
 
 from brightness_extractor.core import (
     ExtractorConfig,
+    ExtractionCancelled,
     brightness_threshold_candidates,
     extract_brightness,
     load_image,
@@ -72,6 +73,70 @@ def test_alpha_and_threshold_pixels_are_excluded():
     assert (result.soft_mask > 0).tolist() == [[True, False], [False, True]]
     assert result.labels[0, 1] == -1 and result.labels[1, 0] == -1
     assert result.main_color_map[1, 0].tolist() == [0, 0, 0]
+
+
+def test_version_three_threshold_factor_and_raw_coefficient_clamping_order(tmp_path):
+    image = np.array([[[1.0, 0, 0, .8]]], dtype=np.float32)
+    enabled = ExtractorConfig(threshold_low=.0, threshold_high=.8, apply_soft_mask_to_output=True, restarts=1, max_iterations=4)
+    disabled = ExtractorConfig(threshold_low=.0, threshold_high=.8, apply_soft_mask_to_output=False, restarts=1, max_iterations=4)
+    with_fade = extract_brightness(image, 1, enabled)
+    without_fade = extract_brightness(image, 1, disabled)
+    # Brightness 1 has T=1 here.  Replace the threshold only to assert that
+    # final-alpha clamping happens after all three factors are multiplied.
+    with_fade.threshold_mask[:] = .5
+    with_fade.k_srgb_raw[:] = 1.5
+    assert with_fade.srgb_asset_alpha()[0, 0] == pytest.approx(.6)
+    assert without_fade.effective_threshold_factor == 1.0
+    saved = with_fade.save(tmp_path / "bundle")
+    metadata = json.loads(saved["palette"].read_text(encoding="utf-8"))
+    assert metadata["threshold_factor"] == {"enabled": True, "definition": "T_eff = threshold_mask if enabled, otherwise 1"}
+    assert "T_eff" in metadata["outputs"]["asset_alpha_srgb_k.png"]["alpha"]
+
+
+def test_linear_and_srgb_coefficients_are_projected_independently():
+    result = extract_brightness(np.array([[[.5, 0, 0, .4]]], dtype=np.float32), 1,
+                                ExtractorConfig(threshold_low=0, threshold_high=.01, working_space="srgb", restarts=1, max_iterations=4))
+    assert result.k_srgb_raw[0, 0] == pytest.approx(.5, abs=.002)
+    assert result.k_linear_raw[0, 0] == pytest.approx(.214041, abs=.002)
+    assert result.srgb_asset_alpha()[0, 0] == pytest.approx(.2, abs=.002)
+    assert result.linear_asset_alpha()[0, 0] == pytest.approx(.085616, abs=.002)
+
+
+def test_rgb_outputs_embed_srgb_profile_and_excluded_pixels_are_transparent_black(tmp_path):
+    image = np.array([[[1., 0, 0, 1], [0, 0, 0, 1]]], dtype=np.float32)
+    result = extract_brightness(image, 1, ExtractorConfig(threshold_low=.01, threshold_high=.02, restarts=1, max_iterations=4))
+    saved = result.save(tmp_path / "bundle")
+    for name in ("main_color", "asset_alpha_linear_k", "asset_alpha_srgb_k", "reconstruction_original_alpha"):
+        with Image.open(saved[name]) as output:
+            assert output.info.get("icc_profile")
+            rgba = np.asarray(output.convert("RGBA"))
+            assert rgba[0, 1].tolist() == [0, 0, 0, 0]
+
+
+def test_embedded_input_profile_is_converted_and_recorded(tmp_path):
+    source = tmp_path / "tagged.png"
+    profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+    Image.fromarray(np.array([[[255, 0, 0]]], dtype=np.uint8), mode="RGB").save(source, icc_profile=profile)
+    rgba, _ = load_image(source)
+    result = extract_brightness(rgba, 1, ExtractorConfig(threshold_low=0, threshold_high=.01, restarts=1, max_iterations=4))
+    metadata = json.loads(result.save(tmp_path / "bundle", source)["palette"].read_text(encoding="utf-8"))
+    assert rgba[0, 0, 0] == pytest.approx(1)
+    assert metadata["input_color_profile"] == "embedded_icc_converted_to_srgb"
+
+
+def test_palette_size_is_bounded():
+    with pytest.raises(ValueError, match="256"):
+        ExtractorConfig().validate(257)
+
+
+def test_cancellation_during_bundle_save_leaves_no_complete_or_partial_result(tmp_path):
+    result = extract_brightness(np.array([[[1., 0, 0]]], dtype=np.float32), 1,
+                                ExtractorConfig(threshold_low=0, threshold_high=.01, restarts=1, max_iterations=4))
+    checks = iter((False, True))
+    with pytest.raises(ExtractionCancelled):
+        result.save(tmp_path / "bundle", cancel=lambda: next(checks, True))
+    assert not (tmp_path / "bundle").exists()
+    assert not list(tmp_path.glob(".bundle.partial-*"))
 
 
 def test_seeded_fit_is_deterministic():

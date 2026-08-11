@@ -9,7 +9,7 @@ import os
 from PySide6.QtCore import QObject, Property, QSettings, QThread, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices
 
-from .core import ExtractorConfig, brightness_threshold_candidates
+from .core import MAX_PALETTE_SIZE, ExtractorConfig, brightness_threshold_candidates
 from .presets import load_preset, save_preset
 from .queue import BatchQueue, QueueItem
 
@@ -135,15 +135,19 @@ class AppController(QObject):
         self.settings.setValue("firstConfig", config.to_dict())
         self.settings.setValue("outputRoot", self._output_root)
 
+    @staticmethod
+    def _local_path(value) -> str:
+        """Accept QML's QUrl values as well as ordinary local-path strings."""
+        if isinstance(value, QUrl):
+            return value.toLocalFile()
+        raw = str(value)
+        return QUrl(raw).toLocalFile() if raw.startswith("file:") else raw
+
     @Slot("QVariantList")
     def addFiles(self, urls):
         paths = []
         for url in urls:
-            if isinstance(url, QUrl):
-                path = url.toLocalFile()
-            else:
-                value = str(url)
-                path = QUrl(value).toLocalFile() if value.startswith("file:") else value
+            path = self._local_path(url)
             if path:
                 paths.append(path)
         added = self.queue.add_paths(paths)
@@ -180,8 +184,8 @@ class AppController(QObject):
     def setColorCount(self, index, count):
         if self.running or not (0 <= index < len(self.queue.items)):
             return
-        if not 1 <= count <= 65_534:
-            self.message.emit("N은 1에서 65,534 사이여야 합니다.")
+        if not 1 <= count <= MAX_PALETTE_SIZE:
+            self.message.emit(f"N은 1에서 {MAX_PALETTE_SIZE} 사이여야 합니다.")
             return
         self.queue.items[index].color_count = count
         if count > 64:
@@ -193,7 +197,7 @@ class AppController(QObject):
         try:
             count = int(values.get("n", 1))
             config = ExtractorConfig.from_dict({key: values[key] for key in ExtractorConfig.__dataclass_fields__})
-            if count < 1: raise ValueError("N은 1 이상이어야 합니다.")
+            if not 1 <= count <= MAX_PALETTE_SIZE: raise ValueError(f"N은 1에서 {MAX_PALETTE_SIZE} 사이여야 합니다.")
         except (KeyError, TypeError, ValueError) as error:
             self.message.emit(f"설정 오류: {error}"); return
         if 0 <= self._selected < len(self.queue.items):
@@ -204,9 +208,9 @@ class AppController(QObject):
             self.message.emit("N이 64를 넘으면 처리 시간과 메모리 사용량이 크게 늘어납니다.")
         self._persist_first(); self.queueChanged.emit(); self.selectedChanged.emit()
 
-    @Slot(str)
+    @Slot("QVariant")
     def setOutputRoot(self, path):
-        self._output_root = path
+        self._output_root = self._local_path(path)
         self._persist_first(); self.outputRootChanged.emit()
 
     @Slot(int, int, int, int)
@@ -216,17 +220,17 @@ class AppController(QObject):
         if x >= 0: self.settings.setValue("windowX", x)
         if y >= 0: self.settings.setValue("windowY", y)
 
-    @Slot(str)
+    @Slot("QVariant")
     def savePreset(self, path):
         try:
             count, config = self.queue.first_config() if self._selected < 0 else self.queue.items[self._selected].clone_config()
-            save_preset(path, count, config); self.message.emit("사전 설정을 저장했습니다.")
+            save_preset(self._local_path(path), count, config); self.message.emit("사전 설정을 저장했습니다.")
         except Exception as error: self.message.emit(str(error))
 
-    @Slot(str)
+    @Slot("QVariant")
     def loadPreset(self, path):
         try:
-            count, config = load_preset(path)
+            count, config = load_preset(self._local_path(path))
             if 0 <= self._selected < len(self.queue.items):
                 self.queue.items[self._selected].color_count, self.queue.items[self._selected].config = count, config
             else:

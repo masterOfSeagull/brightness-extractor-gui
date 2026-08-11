@@ -8,19 +8,26 @@ from __future__ import annotations
 import json
 import math
 import shutil
+import uuid
+from io import BytesIO
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Literal, Mapping
 
 import cv2
 import numpy as np
-from PIL import Image, ImageOps
+from PIL import Image, ImageCms, ImageOps
 
 WorkingSpace = Literal["linear_rgb", "srgb"]
 BrightnessSpace = Literal["srgb", "working"]
 BrightnessMetric = Literal["max", "luminance"]
 FitMode = Literal["atmosphere", "equal_hue", "rgb_mse"]
 ProgressCallback = Callable[[str, float], None]
+MAX_PALETTE_SIZE = 256
+
+
+def _srgb_profile_bytes() -> bytes:
+    return ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
 
 
 class ExtractionCancelled(RuntimeError):
@@ -91,8 +98,12 @@ class ExtractionResult:
     def soft_mask(self) -> np.ndarray: return self.threshold_mask * self.input_alpha
 
     def _asset_alpha(self, coefficient: np.ndarray) -> np.ndarray:
-        mask = self.threshold_mask if self.config.apply_soft_mask_to_output else 1.0
-        return np.clip(self.input_alpha * mask * coefficient * self.valid_mask, 0, 1).astype(np.float32)
+        return np.clip(self.input_alpha * self.effective_threshold_factor * coefficient * self.valid_mask, 0, 1).astype(np.float32)
+
+    @property
+    def effective_threshold_factor(self) -> np.ndarray | float:
+        """The one threshold term shared by every Version-3 output equation."""
+        return self.threshold_mask if self.config.apply_soft_mask_to_output else 1.0
 
     def linear_asset_alpha(self) -> np.ndarray: return self._asset_alpha(self.k_linear_raw)
     def srgb_asset_alpha(self) -> np.ndarray: return self._asset_alpha(self.k_srgb_raw)
@@ -100,7 +111,7 @@ class ExtractionResult:
     def reconstruction_working(self) -> np.ndarray:
         coefficient = self.k_linear_raw if self.config.working_space == "linear_rgb" else self.k_srgb_raw
         rgb = self.main_color_map_working * coefficient[..., None]
-        if self.config.apply_soft_mask_to_output: rgb *= self.threshold_mask[..., None]
+        rgb *= np.asarray(self.effective_threshold_factor)[..., None] if self.config.apply_soft_mask_to_output else 1.0
         return np.clip(rgb, 0, 1)
 
     def reconstruction_original_alpha_rgba(self) -> np.ndarray:
@@ -114,9 +125,14 @@ class ExtractionResult:
         """Compatibility view: configured-working-space reconstruction."""
         return self.reconstruction_working()
 
-    def save(self, output_dir: str | Path, source_path: str | Path | None = None) -> dict[str, Path]:
+    def save(self, output_dir: str | Path, source_path: str | Path | None = None,
+             cancel: Callable[[], bool] | None = None, progress: Callable[[str, float], None] | None = None) -> dict[str, Path]:
         """Save a self-contained extraction bundle with concise, stable asset names."""
-        target = Path(output_dir); target.mkdir(parents=True, exist_ok=True)
+        final_target = Path(output_dir)
+        if final_target.exists(): raise FileExistsError(f"result directory already exists: {final_target}")
+        temporary = final_target.parent / f".{final_target.name}.partial-{uuid.uuid4().hex}"
+        temporary.mkdir(parents=True)
+        target = temporary
         paths = {"main_color": target / "main_color.png", "labels": target / "labels.png",
                  "threshold_mask": target / "threshold_mask.png", "input_alpha": target / "input_alpha.png",
                  "brightness_k_linear": target / "brightness_k_linear.png", "brightness_k_srgb": target / "brightness_k_srgb.png",
@@ -126,36 +142,55 @@ class ExtractionResult:
             source = Path(source_path)
             if source.is_file():
                 paths["original"] = target / f"original{source.suffix.lower()}"
-                shutil.copy2(source, paths["original"])
-        _save_gray16(paths["threshold_mask"], self.threshold_mask); _save_gray16(paths["input_alpha"], self.input_alpha)
-        _save_gray16(paths["brightness_k_linear"], np.where(self.valid_mask, self.k_linear_raw, 0))
-        _save_gray16(paths["brightness_k_srgb"], np.where(self.valid_mask, self.k_srgb_raw, 0))
-        Image.fromarray(np.where(self.valid_mask, self.labels + 1, 0).astype(np.uint16)).save(paths["labels"])
-        valid = self.valid_mask
-        color_srgb = np.zeros((*self.labels.shape, 3), dtype=np.float32)
-        if np.any(valid): color_srgb[valid] = self.palette_srgb[self.labels[valid]]
-        color_u8 = _to_u8(color_srgb)
-        Image.fromarray(np.dstack((color_u8, np.where(valid, 255, 0).astype(np.uint8))), mode="RGBA").save(paths["main_color"])
-        Image.fromarray(np.dstack((color_u8, _to_u8(self.linear_asset_alpha()))), mode="RGBA").save(paths["asset_alpha_linear_k"])
-        Image.fromarray(np.dstack((color_u8, _to_u8(self.srgb_asset_alpha()))), mode="RGBA").save(paths["asset_alpha_srgb_k"])
-        Image.fromarray(self.reconstruction_original_alpha_rgba(), mode="RGBA").save(paths["reconstruction_original_alpha"])
-        metadata = {"format_version": 3, "fit_working_space": self.config.working_space, "input_assumed_color_space": "srgb",
+        def write(name: str, action: Callable[[], None], ordinal: int) -> None:
+            _check_cancel(cancel); action(); _check_cancel(cancel)
+            if progress: progress(name, ordinal / 10)
+        try:
+            write("threshold_mask.png", lambda: _save_gray16(paths["threshold_mask"], self.threshold_mask), 1)
+            write("input_alpha.png", lambda: _save_gray16(paths["input_alpha"], self.input_alpha), 2)
+            write("brightness_k_linear.png", lambda: _save_gray16(paths["brightness_k_linear"], np.where(self.valid_mask, self.k_linear_raw, 0)), 3)
+            write("brightness_k_srgb.png", lambda: _save_gray16(paths["brightness_k_srgb"], np.where(self.valid_mask, self.k_srgb_raw, 0)), 4)
+            write("labels.png", lambda: Image.fromarray(np.where(self.valid_mask, self.labels + 1, 0).astype(np.uint16)).save(paths["labels"]), 5)
+            if "original" in paths: write(paths["original"].name, lambda: shutil.copy2(source_path, paths["original"]), 6)
+            valid = self.valid_mask
+            color_srgb = np.zeros((*self.labels.shape, 3), dtype=np.float32)
+            if np.any(valid): color_srgb[valid] = self.palette_srgb[self.labels[valid]]
+            color_u8 = _to_u8(color_srgb)
+            write("main_color.png", lambda: _save_srgb_rgba(paths["main_color"], np.dstack((color_u8, np.where(valid, 255, 0).astype(np.uint8)))), 7)
+            write("asset_alpha_linear_k.png", lambda: _save_srgb_rgba(paths["asset_alpha_linear_k"], np.dstack((color_u8, _to_u8(self.linear_asset_alpha())))), 8)
+            write("asset_alpha_srgb_k.png", lambda: _save_srgb_rgba(paths["asset_alpha_srgb_k"], np.dstack((color_u8, _to_u8(self.srgb_asset_alpha())))), 9)
+            write("reconstruction_original_alpha.png", lambda: _save_srgb_rgba(paths["reconstruction_original_alpha"], self.reconstruction_original_alpha_rgba()), 9)
+            metadata = {"format_version": 3, "fit_working_space": self.config.working_space, "input_color_profile": _input_profile_description(source_path),
+                    "processing_input_space": "sRGB", "output_color_profile": "sRGB IEC61966-2.1",
                     "input_alpha_representation": "straight", "null_label_in_memory": -1,
                     "null_label_in_png": 0, "png_palette_labels": "1..N correspond to JSON palette entries 0..N-1",
                     "config": asdict(self.config), "palette_working_rgb": self.palette_working.astype(float).tolist(),
                     "palette_linear_rgb": self.palette_linear.astype(float).tolist(), "palette_srgb": self.palette_srgb.astype(float).tolist(),
-                    "outputs": {"asset_alpha_linear_k.png": {"rgb": "palette_srgb", "alpha": "clip(input_alpha * threshold_mask * k_linear, 0, 1)", "intended_compositing": "linear-light source-over"},
-                                "asset_alpha_srgb_k.png": {"rgb": "palette_srgb", "alpha": "clip(input_alpha * threshold_mask * k_srgb, 0, 1)", "intended_compositing": "encoded-srgb compatibility"},
-                                "reconstruction_original_alpha.png": {"rgb": "configured-working-space reconstruction with optional threshold fade", "alpha": "original input alpha for retained pixels; zero when excluded"}},
+                    "threshold_factor": {"enabled": self.config.apply_soft_mask_to_output, "definition": "T_eff = threshold_mask if enabled, otherwise 1"},
+                    "outputs": {"asset_alpha_linear_k.png": {"rgb": "palette_srgb", "alpha": "clip(input_alpha * T_eff * k_linear_raw, 0, 1)", "intended_compositing": "linear-light source-over"},
+                                "asset_alpha_srgb_k.png": {"rgb": "palette_srgb", "alpha": "clip(input_alpha * T_eff * k_srgb_raw, 0, 1)", "intended_compositing": "encoded-srgb compatibility"},
+                                "reconstruction_original_alpha.png": {"rgb": "encode_if_needed(clip(T_eff * k_working_raw * representative_working, 0, 1))", "alpha": "input_alpha for valid pixels; otherwise 0"}},
                     "statistics": _json_safe({**self.statistics, "source_bit_depth": self.source_bit_depth})}
-        paths["palette"].write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
-        return paths
+            write("palette.json", lambda: paths["palette"].write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"), 10)
+            _check_cancel(cancel)
+            final_paths = {name: final_target / path.name for name, path in paths.items()}
+            temporary.replace(final_target)
+            return final_paths
+        except Exception:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise
 
 
 def load_image(path: str | Path) -> tuple[np.ndarray, int]:
     """Load path input as normalized RGBA without an implicit 16-bit downcast."""
     try:
-        with Image.open(path) as opened: orientation = int(opened.getexif().get(274, 1))
+        with Image.open(path) as opened:
+            orientation = int(opened.getexif().get(274, 1))
+            profile = opened.info.get("icc_profile")
+            if profile:
+                source_profile = ImageCms.ImageCmsProfile(BytesIO(profile))
+                converted = ImageCms.profileToProfile(opened, source_profile, ImageCms.createProfile("sRGB"), outputMode="RGBA")
+                return _array_to_rgba(np.asarray(ImageOps.exif_transpose(converted).copy())), 8
         decoded = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
         if decoded is not None and decoded.ndim in (2, 3):
             if decoded.ndim == 3 and decoded.shape[2] == 3: decoded = cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB)
@@ -224,6 +259,17 @@ def extract_brightness(image: str | Path | Image.Image | np.ndarray, color_count
     reconstruction_working = colors[valid_indices] * (k_linear_raw[valid_indices, None] if cfg.working_space == "linear_rgb" else k_srgb_raw[valid_indices, None])
     if cfg.apply_soft_mask_to_output: reconstruction_working *= threshold_mask.reshape(-1)[valid_indices, None]
     cluster_sizes = np.bincount(labels_flat[valid_indices], minlength=color_count).astype(int)
+    cluster_weights = np.bincount(labels_flat[valid_indices], weights=weights, minlength=color_count)
+    cluster_statistics = []
+    assigned_labels = labels_flat[valid_indices]
+    for cluster in range(color_count):
+        members = assigned_labels == cluster
+        raw_linear, raw_srgb = k_linear_raw[valid_indices][members], k_srgb_raw[valid_indices][members]
+        cluster_statistics.append({"assigned_pixel_count": int(cluster_sizes[cluster]), "weight_sum": float(cluster_weights[cluster]),
+            "k_linear_raw": _coefficient_summary(raw_linear), "k_srgb_raw": _coefficient_summary(raw_srgb),
+            "representative_working_rgb": palette_working[cluster].astype(float).tolist(),
+            "representative_linear_rgb": palette_linear[cluster].astype(float).tolist(),
+            "representative_srgb": palette_srgb[cluster].astype(float).tolist()})
     statistics = {"image_width": width, "image_height": height, "total_pixels": int(width * height), "retained_pixels": int(valid_indices.size),
                   "fit_sample_pixels": int(sample_indices.size), "cluster_pixel_counts": cluster_sizes.tolist(),
                   "cluster_pixel_fractions": (cluster_sizes / valid_indices.size).tolist(), "weighted_angular_fit_objective": float(objective),
@@ -233,6 +279,7 @@ def extract_brightness(image: str | Path | Image.Image | np.ndarray, color_count
                   "k_linear_over_one_count": int(np.count_nonzero(k_linear_raw[valid_indices] > 1)),
                   "k_srgb_over_one_count": int(np.count_nonzero(k_srgb_raw[valid_indices] > 1)),
                   "best_restart_zero_based": int(best_restart), "best_restart_iterations": int(iterations),
+                  "cluster_statistics": cluster_statistics,
                   "near_duplicate_palette_pairs_zero_based": _find_duplicate_palette_pairs(palette_units)}
     _report(progress, "done", 1)
     return ExtractionResult(palette_working, palette_linear, palette_srgb, labels_flat.reshape(height, width), threshold_mask.astype(np.float32), input_alpha.astype(np.float32),
@@ -360,8 +407,19 @@ def _srgb_to_linear(value):
 def _linear_to_srgb(value):
     value = np.clip(np.asarray(value, dtype=np.float32), 0, 1); return np.where(value <= .0031308, 12.92 * value, 1.055 * np.power(value, 1 / 2.4) - .055).astype(np.float32)
 def _save_gray16(path, value): Image.fromarray(np.round(np.clip(value, 0, 1) * 65535).astype(np.uint16)).save(path)
+def _save_srgb_rgba(path, rgba): Image.fromarray(rgba, mode="RGBA").save(path, icc_profile=_srgb_profile_bytes())
+def _input_profile_description(source_path):
+    if source_path is None: return "untagged_assumed_srgb"
+    try:
+        with Image.open(source_path) as source:
+            return "embedded_icc_converted_to_srgb" if source.info.get("icc_profile") else "untagged_assumed_srgb"
+    except OSError: return "untagged_assumed_srgb"
 def _to_u8(value): return np.round(np.clip(value, 0, 1) * 255).astype(np.uint8)
 def _find_duplicate_palette_pairs(palette, cosine_threshold=.99999): return [[a, b] for a in range(palette.shape[0]) for b in range(a + 1, palette.shape[0]) if float(np.dot(palette[a], palette[b])) >= cosine_threshold]
+def _coefficient_summary(values):
+    if not values.size: return {"minimum": None, "maximum": None, "mean": None, "over_one_count": 0, "over_one_fraction": 0.0}
+    return {"minimum": float(np.min(values)), "maximum": float(np.max(values)), "mean": float(np.mean(values)),
+            "over_one_count": int(np.count_nonzero(values > 1)), "over_one_fraction": float(np.mean(values > 1))}
 def _check_cancel(cancel):
     if cancel and cancel(): raise ExtractionCancelled("Extraction cancelled")
 def _report(progress, stage, fraction):
@@ -373,7 +431,7 @@ def _json_safe(value):
     if isinstance(value, np.generic): return value.item()
     return value
 def _validate_config(config, color_count):
-    if not 1 <= color_count <= 65_534: raise ValueError("color_count must be between 1 and 65,534")
+    if not 1 <= color_count <= MAX_PALETTE_SIZE: raise ValueError(f"color_count must be between 1 and {MAX_PALETTE_SIZE}")
     if not 0 <= config.threshold_low < config.threshold_high <= 1: raise ValueError("thresholds must satisfy 0 <= low < high <= 1")
     if config.brightness_metric not in ("max", "luminance"): raise ValueError("brightness_metric must be 'max' or 'luminance'")
     if config.brightness_space not in ("srgb", "working"): raise ValueError("brightness_space must be 'srgb' or 'working'")

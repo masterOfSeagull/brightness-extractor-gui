@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -55,6 +56,17 @@ def test_file_dialog_url_uses_its_local_path_and_seeds_output_folder(tmp_path):
     assert first.items[0]["path"] == str(image_path.resolve())
     assert first.items[0]["n"] == 1
     assert first.outputRoot == str(tmp_path)
+
+
+def test_qml_urls_save_presets_and_output_folder_to_their_local_paths(tmp_path):
+    controller = AppController()
+    preset = tmp_path / "settings.json"
+
+    controller.setOutputRoot(QUrl.fromLocalFile(str(tmp_path)))
+    controller.savePreset(QUrl.fromLocalFile(str(preset)))
+
+    assert Path(controller.outputRoot) == tmp_path
+    assert preset.is_file()
 
 
 def test_old_implicit_default_of_three_migrates_to_one(tmp_path):

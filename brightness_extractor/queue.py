@@ -96,12 +96,14 @@ class BatchQueue:
                 while item.result_dir.exists():
                     item.result_dir = image_root / f"{timestamp}-{suffix}"
                     suffix += 1
-                self._item_progress(item, "save", 0, index, notify)
-                saved = result.save(item.result_dir, item.path)
+                self._item_progress(item, "prepare_output", 0, index, notify)
+                self._item_progress(item, "prepare_output", 1, index, notify)
+                saved = result.save(item.result_dir, item.path, cancel=cancel.is_set,
+                    progress=lambda filename, value: self._item_progress(item, "metadata" if filename == "palette.json" else "save", value, index, notify))
                 item.result_preview = saved["reconstruction_original_alpha"]
                 item.status, item.progress = "완료", 1.0
             except ExtractionCancelled:
-                item.status = "취소됨"
+                item.status, item.result_dir, item.result_preview = "취소됨", None, None
                 if notify:
                     notify(index, item)
                 break
@@ -113,7 +115,8 @@ class BatchQueue:
 
     @staticmethod
     def _item_progress(item: QueueItem, stage: str, value: float, index: int, notify: Callable[[int, QueueItem], None] | None) -> None:
-        ranges = {"load": (0.0, .05), "fit": (.05, .70), "classify": (.70, .92), "done": (.92, .97), "save": (.97, 1.0)}
+        ranges = {"load": (0.0, .05), "fit": (.05, .70), "classify": (.70, .85), "done": (.85, .85),
+                  "prepare_output": (.85, .90), "save": (.90, .98), "metadata": (.98, 1.0)}
         start, end = ranges.get(stage, (0.0, 1.0))
         item.progress = max(item.progress, start + (end - start) * value)
         if notify:
