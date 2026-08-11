@@ -13,6 +13,7 @@ from brightness_extractor.core import (
     load_image,
     save_result_bundle,
 )
+from brightness_extractor.core import _fitting_weights, _pixel_brightness, _smoothstep
 
 
 def test_defaults_match_the_supplied_extractor_configuration():
@@ -33,7 +34,7 @@ def test_exact_color_rays_reconstruct_and_palette_are_consistent(tmp_path):
     assert result.palette.shape == (3, 3)
     assert np.max(np.abs(result.reconstruction() - image)) < 0.01
     source = tmp_path / "synthetic.png"
-    Image.fromarray(np.round(image * 255).astype(np.uint8), mode="RGB").save(source)
+    Image.fromarray(np.round(image * 255).astype(np.uint8)).save(source)
     folder = save_result_bundle(result, tmp_path / "bundle", source, 3, ExtractorConfig())
     assert {"original.png", "main_color.png", "labels.png", "threshold_mask.png", "input_alpha.png", "brightness_k_linear.png", "brightness_k_srgb.png", "asset_alpha_linear_k.png", "asset_alpha_srgb_k.png", "reconstruction_original_alpha.png", "palette.json"} <= {p.name for p in folder.iterdir()}
     palette = json.loads((folder / "palette.json").read_text(encoding="utf-8"))
@@ -45,7 +46,7 @@ def test_version_three_exports_keep_input_alpha_separate_from_threshold_and_asse
     config = ExtractorConfig(threshold_low=.02, threshold_high=.03, restarts=1, max_iterations=10)
     result = extract_brightness(image, 1, config)
     source = tmp_path / "input.png"
-    Image.fromarray(np.round(image * 255).astype(np.uint8), mode="RGB").save(source)
+    Image.fromarray(np.round(image[..., :3] * 255).astype(np.uint8)).save(source)
     saved = result.save(tmp_path / "bundle", source)
     reconstruction = np.asarray(Image.open(saved["reconstruction_original_alpha"]).convert("RGBA"))
     input_alpha = np.asarray(Image.open(saved["input_alpha"]))
@@ -116,17 +117,76 @@ def test_rgb_outputs_embed_srgb_profile_and_excluded_pixels_are_transparent_blac
 def test_embedded_input_profile_is_converted_and_recorded(tmp_path):
     source = tmp_path / "tagged.png"
     profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
-    Image.fromarray(np.array([[[255, 0, 0]]], dtype=np.uint8), mode="RGB").save(source, icc_profile=profile)
+    Image.fromarray(np.array([[[255, 0, 0]]], dtype=np.uint8)).save(source, icc_profile=profile)
     rgba, _ = load_image(source)
-    result = extract_brightness(rgba, 1, ExtractorConfig(threshold_low=0, threshold_high=.01, restarts=1, max_iterations=4))
+    result = extract_brightness(source, 1, ExtractorConfig(threshold_low=0, threshold_high=.01, restarts=1, max_iterations=4))
     metadata = json.loads(result.save(tmp_path / "bundle", source)["palette"].read_text(encoding="utf-8"))
     assert rgba[0, 0, 0] == pytest.approx(1)
     assert metadata["input_color_profile"] == "embedded_icc_converted_to_srgb"
+    assert metadata["statistics"]["color_conversion_applied"] is True
+
+
+def test_tagged_palette_png_preserves_transparency_during_icc_conversion(tmp_path):
+    source = tmp_path / "palette.png"
+    image = Image.new("P", (2, 1))
+    image.putpalette([255, 0, 0, 0, 255, 0] + [0] * 762)
+    image.putdata([0, 1])
+    image.info["transparency"] = 0
+    profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+    image.save(source, icc_profile=profile)
+    rgba, info = load_image(source, with_info=True)
+    assert info.input_profile_status == "embedded_icc_converted_to_srgb"
+    assert rgba[0, 0, 3] == 0
+    assert rgba[0, 1, 3] == 1
+
+
+def test_malformed_icc_profile_uses_friendly_image_load_error(tmp_path):
+    source = tmp_path / "bad-profile.png"
+    Image.new("RGB", (1, 1), "red").save(source, icc_profile=b"not an ICC profile")
+    with pytest.raises(ValueError, match=source.name):
+        load_image(source)
+
+
+def test_tagged_16_bit_input_records_the_documented_8_bit_processing_policy(tmp_path):
+    source = tmp_path / "tagged-16.png"
+    profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+    Image.fromarray(np.array([[0, 4096, 65535]], dtype=np.uint16)).save(source, icc_profile=profile)
+    _, info = load_image(source, with_info=True)
+    assert info.source_bit_depth == 16
+    assert info.processing_bit_depth == 8
+    assert info.color_conversion_applied is True
 
 
 def test_palette_size_is_bounded():
     with pytest.raises(ValueError, match="256"):
         ExtractorConfig().validate(257)
+
+
+def test_cluster_weight_statistics_use_all_classified_pixels_when_fitting_is_sampled():
+    image = np.array([[[1., 0, 0], [0, 1., 0], [1., .2, 0], [0, .3, 1.]]], dtype=np.float32)
+    config = ExtractorConfig(threshold_low=0, threshold_high=.01, fit_sample_limit=2, restarts=1, max_iterations=4, random_seed=3)
+    result = extract_brightness(image, 2, config)
+    brightness = _pixel_brightness(image, config.brightness_metric).reshape(-1)
+    mask = _smoothstep(config.threshold_low, config.threshold_high, brightness)
+    weights = _fitting_weights(config, mask, brightness, np.linalg.norm(image.reshape(-1, 3), axis=1))
+    expected = np.bincount(result.labels.reshape(-1), weights=weights, minlength=2)
+    actual = np.array([item["weight_sum"] for item in result.statistics["cluster_statistics"]])
+    assert np.allclose(actual, expected)
+
+
+def test_fitting_sample_limit_smaller_than_retained_pixels_completes():
+    image = np.full((20, 20, 3), [1., .1, .05], dtype=np.float32)
+    result = extract_brightness(image, 1, ExtractorConfig(threshold_low=0, threshold_high=.01, fit_sample_limit=7, restarts=1, max_iterations=3))
+    assert result.statistics["retained_pixels"] == 400
+    assert result.statistics["fit_sample_pixels"] == 7
+
+
+def test_default_sample_limit_handles_501_by_500_fully_retained_image():
+    image = np.full((501, 500, 3), [1., .1, .05], dtype=np.float32)
+    result = extract_brightness(image, 1, ExtractorConfig(threshold_low=0, threshold_high=.01, restarts=1, max_iterations=2))
+    assert result.statistics["retained_pixels"] == 250_500
+    assert result.statistics["fit_sample_pixels"] == 250_000
+    assert sum(item["assigned_pixel_count"] for item in result.statistics["cluster_statistics"]) == 250_500
 
 
 def test_cancellation_during_bundle_save_leaves_no_complete_or_partial_result(tmp_path):
@@ -137,6 +197,17 @@ def test_cancellation_during_bundle_save_leaves_no_complete_or_partial_result(tm
         result.save(tmp_path / "bundle", cancel=lambda: next(checks, True))
     assert not (tmp_path / "bundle").exists()
     assert not list(tmp_path.glob(".bundle.partial-*"))
+
+
+def test_save_progress_reaches_one_only_after_atomic_publication(tmp_path):
+    result = extract_brightness(np.array([[[1., 0, 0]]], dtype=np.float32), 1,
+                                ExtractorConfig(threshold_low=0, threshold_high=.01, restarts=1, max_iterations=4))
+    updates = []
+    target = tmp_path / "bundle"
+    result.save(target, progress=lambda name, value: updates.append((name, value, target.exists())))
+    assert all(left[1] <= right[1] for left, right in zip(updates, updates[1:]))
+    assert all(value < 1 and not published for _, value, published in updates[:-1])
+    assert updates[-1] == ("published", 1.0, True)
 
 
 def test_seeded_fit_is_deterministic():

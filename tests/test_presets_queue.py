@@ -70,3 +70,21 @@ def test_cancellation_stops_before_next_item(tmp_path):
     cancel = threading.Event(); cancel.set()
     queue.run(tmp_path, cancel)
     assert [item.status for item in queue.items] == ["대기", "대기"]
+
+
+def test_save_failure_clears_nonexistent_result_paths(tmp_path, monkeypatch):
+    source = tmp_path / "input.png"
+    Image.fromarray(np.array([[[255, 0, 0]]], dtype=np.uint8)).save(source)
+    queue = BatchQueue(ExtractorConfig(restarts=1, max_iterations=3, threshold_low=0, threshold_high=.01), 1)
+    queue.add_paths([source])
+
+    class FailedResult:
+        def save(self, *_args, **_kwargs):
+            raise OSError("simulated write failure")
+
+    monkeypatch.setattr("brightness_extractor.queue.extract_brightness", lambda *_args, **_kwargs: FailedResult())
+    queue.run(tmp_path)
+    item = queue.items[0]
+    assert item.status == "실패"
+    assert item.result_dir is None and item.result_preview is None
+    assert "simulated write failure" in item.error

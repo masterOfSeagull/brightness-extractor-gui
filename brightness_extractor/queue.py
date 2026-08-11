@@ -79,10 +79,13 @@ class BatchQueue:
             if notify:
                 notify(index, item)
             try:
-                image, bit_depth = load_image(item.path)
+                image, load_info = load_image(item.path, with_info=True)
                 result = extract_brightness(image, item.color_count, item.config,
                     progress=lambda stage, value: self._item_progress(item, stage, value, index, notify),
-                    cancel=cancel.is_set, source_bit_depth=bit_depth)
+                    cancel=cancel.is_set, source_bit_depth=load_info.source_bit_depth,
+                    processing_bit_depth=load_info.processing_bit_depth,
+                    input_profile_status=load_info.input_profile_status,
+                    color_conversion_applied=load_info.color_conversion_applied)
                 source_folder = re.sub(r"[^\w.-]+", "_", item.path.stem, flags=re.UNICODE).strip("._") or "image"
                 image_root = root / source_folder
                 # The convenient default output root is often the source file's
@@ -99,7 +102,7 @@ class BatchQueue:
                 self._item_progress(item, "prepare_output", 0, index, notify)
                 self._item_progress(item, "prepare_output", 1, index, notify)
                 saved = result.save(item.result_dir, item.path, cancel=cancel.is_set,
-                    progress=lambda filename, value: self._item_progress(item, "metadata" if filename == "palette.json" else "save", value, index, notify))
+                    progress=lambda filename, value: self._item_progress(item, "metadata" if filename == "palette.json" else ("published" if filename == "published" else "save"), value, index, notify))
                 item.result_preview = saved["reconstruction_original_alpha"]
                 item.status, item.progress = "완료", 1.0
             except ExtractionCancelled:
@@ -108,7 +111,7 @@ class BatchQueue:
                     notify(index, item)
                 break
             except Exception as error:  # individual invalid files do not stop the batch
-                item.status, item.error = "실패", str(error)
+                item.status, item.error, item.result_dir, item.result_preview = "실패", str(error), None, None
             if notify:
                 notify(index, item)
         return root
@@ -116,7 +119,7 @@ class BatchQueue:
     @staticmethod
     def _item_progress(item: QueueItem, stage: str, value: float, index: int, notify: Callable[[int, QueueItem], None] | None) -> None:
         ranges = {"load": (0.0, .05), "fit": (.05, .70), "classify": (.70, .85), "done": (.85, .85),
-                  "prepare_output": (.85, .90), "save": (.90, .98), "metadata": (.98, 1.0)}
+                  "prepare_output": (.85, .90), "save": (.90, .98), "metadata": (.98, .999), "published": (1.0, 1.0)}
         start, end = ranges.get(stage, (0.0, 1.0))
         item.progress = max(item.progress, start + (end - start) * value)
         if notify:

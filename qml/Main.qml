@@ -149,7 +149,9 @@ ApplicationWindow {
         return setting.working_space === "linear_rgb" ? "Linear RGB 작업 색공간" : "sRGB 작업 색공간"
     }
     function brightnessMetricLabel() {
-        return setting.brightness_metric === "luminance" ? "상대 휘도" : "max(R,G,B)"
+        if (setting.brightness_metric !== "luminance") return "max(R,G,B)"
+        return setting.brightness_space === "working" && setting.working_space === "linear_rgb"
+                ? "상대 휘도" : "인코딩된 sRGB 루마"
     }
     Connections {
         target: backend
@@ -418,10 +420,10 @@ ApplicationWindow {
                             ColumnLayout { anchors.fill: parent; anchors.margins: 13; spacing: 6
                                 Label { text: "내부 동작 · 현재 기본값 기준"; color: root.ink; font.family: pretendardMedium.name; font.pixelSize: 12 }
                                 Label { Layout.fillWidth: true; text: "1. 밝기 B를 구합니다. ‘측정 색공간’이 sRGB이면 원본 sRGB에서, working이면 작업 색공간에서 계산합니다. 작업 색공간이 linear_rgb이면 먼저 Linear RGB로 변환합니다. 기본값은 sRGB의 B = max(R, G, B)이며, luminance는 0.2126R + 0.7152G + 0.0722B입니다. 아래 후보 표도 이 현재 설정을 그대로 씁니다."; color: root.ink; font.pixelSize: 11; wrapMode: Text.WordWrap; lineHeight: 1.18 }
-                                Label { Layout.fillWidth: true; text: "2. T = smoothstep(하한, 상한, B)는 임계값 마스크이고, A는 원본 알파입니다(RGB 입력은 A = 1). 유효 픽셀은 T > 0, A > 0, RGB 크기 > 0을 모두 만족합니다. 두 알파 자산은 A × T × k를, 재구성 이미지는 A를 그대로 알파로 쓰고 밝기는 RGB에 구워 넣습니다."; color: root.ink; font.pixelSize: 11; wrapMode: Text.WordWrap; lineHeight: 1.18 }
+                                Label { Layout.fillWidth: true; text: "2. T = smoothstep(하한, 상한, B), A = 원본 알파, M = T × A입니다. M은 맞춤/선택 마스크입니다. 출력에서는 임계값 페이드를 켜면 T_eff = T, 끄면 T_eff = 1을 사용합니다."; color: root.ink; font.pixelSize: 11; wrapMode: Text.WordWrap; lineHeight: 1.18 }
                                 Label { Layout.fillWidth: true; text: "3. atmosphere 맞춤의 실제 가중치는 W = M × [F + (1 − F) × B^P]입니다. F는 가중치 바닥, P는 가중치 지수입니다. 0 < B < 1에서 P가 작을수록 어두운·중간 픽셀의 비중이 커지고, P가 클수록 밝은 픽셀 쪽으로 더 기웁니다."; color: root.ink; font.pixelSize: 11; wrapMode: Text.WordWrap; lineHeight: 1.18 }
-                                Label { Layout.fillWidth: true; text: "4. 유지된 RGB를 작업 색공간에서 단위 방향으로 정규화해 K-lines로 색상 레이를 찾습니다. 각 픽셀은 가장 가까운 레이를 고르고, 밝기 계수 k = dot(pixel, ray) / dot(ray, ray)로 투영합니다. 마스크 적용을 켜면 저장 밝기는 k × M입니다."; color: root.ink; font.pixelSize: 11; wrapMode: Text.WordWrap; lineHeight: 1.18 }
-                                Label { Layout.fillWidth: true; text: "참고: equal_hue는 W = M, rgb_mse는 W = M × ||RGB||²입니다. 0–1 제한은 k와 저장값을 잘라 PNG 범위 안에 둡니다."; color: root.muted; font.pixelSize: 11; wrapMode: Text.WordWrap; lineHeight: 1.15 }
+                                Label { Layout.fillWidth: true; text: "4. 각 픽셀은 가장 가까운 K-lines 레이를 고르고 k_raw = dot(pixel, ray) / dot(ray, ray)로 투영합니다. 자산 알파 = clip(A × T_eff × k_raw, 0, 1). 재구성은 A를 유지하고 T_eff × k_working_raw를 RGB에 굽습니다. k_raw 자체는 자르지 않습니다."; color: root.ink; font.pixelSize: 11; wrapMode: Text.WordWrap; lineHeight: 1.18 }
+                                Label { Layout.fillWidth: true; text: "참고: 투명 자산은 일반 뷰어 배경과 합성되어 더 밝거나 회색·저채도로 보일 수 있습니다. sRGB 자산은 인코딩 sRGB의 검정 배경에서, Linear 자산은 선형광 검정 배경에서 비교하세요."; color: root.muted; font.pixelSize: 11; wrapMode: Text.WordWrap; lineHeight: 1.15 }
                             }
                         }
                     }
