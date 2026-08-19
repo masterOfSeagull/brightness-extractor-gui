@@ -189,9 +189,12 @@ class FrameSamplerApp:
             if end is None or end < start:
                 raise ValueError
             count = int(math.floor((end - start) / period + 1e-9)) + 1
+            suffix = ""
+            if self.fps and period < (1.0 / self.fps) * 0.999:
+                suffix = f"  ·  period is below one source frame ({1.0 / self.fps:.4f} s)"
             self.estimate_var.set(
                 f"Estimated output: {count:,} image{'s' if count != 1 else ''} from "
-                f"{format_time(start)} to {format_time(end)}"
+                f"{format_time(start)} to {format_time(end)}{suffix}"
             )
         except Exception:
             self.estimate_var.set("")
@@ -220,6 +223,13 @@ class FrameSamplerApp:
         period = float(self.period_var.get())
         if not math.isfinite(period) or period <= 0:
             raise ValueError("Sampling period must be greater than zero.")
+        if self.fps:
+            min_period = 1.0 / self.fps
+            if period < min_period * 0.999:
+                raise ValueError(
+                    f"Sampling period is shorter than one source frame. "
+                    f"For {self.fps:.3f} fps, use at least {min_period:.6f} seconds."
+                )
 
         return video_path, output_dir, start, end, period, self.format_var.get()
 
