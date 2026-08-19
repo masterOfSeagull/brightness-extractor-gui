@@ -19,6 +19,12 @@ The primary use case is scenes where more than one coherent translation may exis
 
 The heatmap visualizes positive correlation values after normalizing to the strongest positive response and applying a square-root display curve. The square-root curve is visualization-only; peak ranking uses the original correlation values. This makes weaker secondary motion hypotheses easier to see.
 
+## Video frame sampler helper
+
+`tools/frame_sampler_gui.py` is an independent small Tkinter/OpenCV utility for preparing image pairs or sampled sequences from longer recordings. It accepts a video, start/end times, sampling period, output folder, and PNG/JPEG format.
+
+It seeks once to the requested start point, then decodes forward sequentially and writes only requested sample frames, avoiding repeated random seeks through a long compressed recording. See `tools/FRAME_SAMPLER.md`, or on Windows run `tools/run_frame_sampler.bat` after installing `tools/requirements-frame-sampler.txt`.
+
 ## Algorithm
 
 1. Load both images as grayscale `float32`.
