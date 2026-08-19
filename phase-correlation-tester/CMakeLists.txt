@@ -24,7 +24,10 @@ qt_add_qml_module(phase-correlation-tester
         qml/Main.qml
 )
 
-target_include_directories(phase-correlation-tester PRIVATE src)
+target_include_directories(phase-correlation-tester PRIVATE
+    src
+    ${OpenCV_INCLUDE_DIRS}
+)
 
 target_link_libraries(phase-correlation-tester PRIVATE
     Qt6::Quick
