@@ -12,7 +12,7 @@ from typing import Callable, Literal, Mapping
 
 import cv2
 import numpy as np
-from PIL import Image, ImageCms, ImageOps
+from PIL import Image, ImageCms, ImageDraw, ImageOps
 
 WorkingSpace = Literal["linear_rgb", "srgb"]
 BrightnessSpace = Literal["srgb", "working"]
@@ -128,6 +128,51 @@ class ExtractionResult:
         rgb[alpha == 0] = 0
         return np.dstack((_to_u8(rgb), _to_u8(alpha)))
 
+    def optical_centroid(self) -> dict[str, float | str]:
+        """Alpha-weighted linear Rec.709 luminance centroid of reconstruction."""
+        rgb = self.reconstruction_working().astype(np.float64, copy=False)
+        if self.config.working_space == "srgb":
+            rgb = _srgb_to_linear(rgb)
+        luminance = np.sum(
+            rgb * np.array([0.2126, 0.7152, 0.0722], dtype=np.float64), axis=2
+        )
+        weights = luminance * np.where(self.valid_mask, self.input_alpha, 0)
+        weight_sum = float(np.sum(weights, dtype=np.float64))
+        height, width = weights.shape
+        if weight_sum > np.finfo(np.float64).eps:
+            yy, xx = np.indices(weights.shape, dtype=np.float64)
+            x = float(np.sum(weights * xx, dtype=np.float64) / weight_sum)
+            y = float(np.sum(weights * yy, dtype=np.float64) / weight_sum)
+        else:
+            x = (width - 1) / 2.0
+            y = (height - 1) / 2.0
+        return {
+            "definition": "alpha-weighted linear Rec.709 luminance centroid",
+            "x_pixels": x,
+            "y_pixels": y,
+            "x_normalized": (x + 0.5) / width,
+            "y_normalized": (y + 0.5) / height,
+            "weight_sum": weight_sum,
+        }
+
+    def reconstruction_centroid_rgba(self) -> np.ndarray:
+        rgba = self.reconstruction_original_alpha_rgba()
+        marked = Image.fromarray(rgba, mode="RGBA")
+        centroid = self.optical_centroid()
+        x = float(centroid["x_pixels"])
+        y = float(centroid["y_pixels"])
+        radius = max(3, int(round(min(marked.size) * 0.0075)))
+        draw = ImageDraw.Draw(marked)
+        draw.ellipse(
+            (x - radius - 1, y - radius - 1, x + radius + 1, y + radius + 1),
+            fill=(255, 255, 255, 255),
+        )
+        draw.ellipse(
+            (x - radius, y - radius, x + radius, y + radius),
+            fill=(255, 0, 0, 255),
+        )
+        return np.asarray(marked)
+
     def reconstruction(self) -> np.ndarray:
         """Compatibility view: configured-working-space reconstruction."""
         return self.reconstruction_working()
@@ -144,13 +189,15 @@ class ExtractionResult:
                  "threshold_mask": target / "threshold_mask.png", "input_alpha": target / "input_alpha.png",
                  "brightness_k_linear": target / "brightness_k_linear.png", "brightness_k_srgb": target / "brightness_k_srgb.png",
                  "asset_alpha_linear_k": target / "asset_alpha_linear_k.png", "asset_alpha_srgb_k": target / "asset_alpha_srgb_k.png",
-                 "reconstruction_original_alpha": target / "reconstruction_original_alpha.png", "palette": target / "palette.json"}
+                 "reconstruction_original_alpha": target / "reconstruction_original_alpha.png",
+                 "reconstruction_original_alpha_centroid": target / "reconstruction_original_alpha_centroid.png",
+                 "palette": target / "palette.json"}
         if source_path is not None:
             source = Path(source_path)
             if source.is_file():
                 paths["original"] = target / f"original{source.suffix.lower()}"
         completed_steps = 0
-        total_steps = 11 + (1 if "original" in paths else 0)
+        total_steps = 12 + (1 if "original" in paths else 0)
         def write(name: str, action: Callable[[], None]) -> None:
             nonlocal completed_steps
             _check_cancel(cancel); action(); _check_cancel(cancel)
@@ -171,6 +218,8 @@ class ExtractionResult:
             write("asset_alpha_linear_k.png", lambda: _save_srgb_rgba(paths["asset_alpha_linear_k"], np.dstack((color_u8, _to_u8(self.linear_asset_alpha())))))
             write("asset_alpha_srgb_k.png", lambda: _save_srgb_rgba(paths["asset_alpha_srgb_k"], np.dstack((color_u8, _to_u8(self.srgb_asset_alpha())))))
             write("reconstruction_original_alpha.png", lambda: _save_srgb_rgba(paths["reconstruction_original_alpha"], self.reconstruction_original_alpha_rgba()))
+            write("reconstruction_original_alpha_centroid.png", lambda: _save_srgb_rgba(paths["reconstruction_original_alpha_centroid"], self.reconstruction_centroid_rgba()))
+            optical_centroid = self.optical_centroid()
             metadata = {"format_version": 3, "fit_working_space": self.config.working_space, "input_color_profile": self.input_profile_status,
                     "processing_input_space": "sRGB", "output_color_profile": "sRGB IEC61966-2.1",
                     "input_alpha_representation": "straight", "null_label_in_memory": -1,
@@ -178,9 +227,11 @@ class ExtractionResult:
                     "config": asdict(self.config), "palette_working_rgb": self.palette_working.astype(float).tolist(),
                     "palette_linear_rgb": self.palette_linear.astype(float).tolist(), "palette_srgb": self.palette_srgb.astype(float).tolist(),
                     "threshold_factor": {"enabled": self.config.apply_soft_mask_to_output, "definition": "T_eff = threshold_mask if enabled, otherwise 1"},
+                    "optical_centroid": optical_centroid,
                     "outputs": {"asset_alpha_linear_k.png": {"rgb": "palette_srgb", "alpha": "clip(input_alpha * T_eff * k_linear_raw, 0, 1)", "intended_compositing": "linear-light source-over"},
                                 "asset_alpha_srgb_k.png": {"rgb": "palette_srgb", "alpha": "clip(input_alpha * T_eff * k_srgb_raw, 0, 1)", "intended_compositing": "encoded-srgb compatibility"},
-                                "reconstruction_original_alpha.png": {"rgb": "encode_if_needed(clip(T_eff * k_working_raw * representative_working, 0, 1))", "alpha": "input_alpha for valid pixels; otherwise 0"}},
+                                "reconstruction_original_alpha.png": {"rgb": "encode_if_needed(clip(T_eff * k_working_raw * representative_working, 0, 1))", "alpha": "input_alpha for valid pixels; otherwise 0"},
+                                "reconstruction_original_alpha_centroid.png": {"base": "reconstruction_original_alpha.png", "overlay": "opaque red dot at optical_centroid"}},
                     "statistics": _json_safe({**self.statistics, "source_bit_depth": self.source_bit_depth,
                                                  "processing_bit_depth": self.processing_bit_depth,
                                                  "color_conversion_applied": self.color_conversion_applied})}

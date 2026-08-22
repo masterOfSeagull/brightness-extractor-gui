@@ -14,7 +14,7 @@ PySide6/QML batch application that fits one weighted K-lines palette and label m
 
 ## Version-3 output bundle
 
-Each run is stored under `output root/original name/timestamp/` and contains the original copy, `main_color.png`, `labels.png`, `threshold_mask.png`, `input_alpha.png`, `brightness_k_linear.png`, `brightness_k_srgb.png`, `asset_alpha_linear_k.png`, `asset_alpha_srgb_k.png`, `reconstruction_original_alpha.png`, and `palette.json`.
+Each run is stored under `output root/original name/timestamp/` and also includes `reconstruction_original_alpha_centroid.png` alongside the existing reconstruction and coefficient outputs.
 
 Input RGB is straight/unassociated sRGB (untagged images are assumed sRGB). RGB files use input alpha `A = 1`; RGBA files retain their original alpha. RGB/RGBA output PNGs embed the sRGB IEC61966-2.1 profile. One fitted palette and label map produce both projection coefficients: `k_l` in Linear RGB and `k_s` in encoded sRGB.
 
@@ -27,5 +27,10 @@ Untagged 16-bit files retain 16-bit decoding precision. ICC-tagged files are con
 - `reconstruction_original_alpha.png`: RGB is `encode_if_needed(clip(T_eff * k_working_raw * representative_working, 0, 1))`; alpha is the retained original `A`.
 
 The metadata records the exact formulas, threshold state, palette representations, and per-cluster unclamped-coefficient statistics. `main_color.png` is a categorical palette/label map, not a compositing asset. N is limited to 256 (1–64 is the normal operating range; 65–256 shows a performance warning).
+
+`palette.json` records `optical_centroid`: the alpha-weighted centroid of linear
+Rec.709 luminance in pixel-center and normalized coordinates. The centroid
+preview places an opaque red marker at that coordinate. Use this as the default
+transform anchor for independently positioned or animated emissive assets.
 
 Transparent alpha assets may look brighter, grayer, or less saturated than the reconstruction in generic image viewers because the viewer composites them over its own background. Compare the sRGB asset over black in encoded sRGB, and the linear asset over black in linear light.

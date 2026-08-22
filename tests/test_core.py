@@ -36,9 +36,10 @@ def test_exact_color_rays_reconstruct_and_palette_are_consistent(tmp_path):
     source = tmp_path / "synthetic.png"
     Image.fromarray(np.round(image * 255).astype(np.uint8)).save(source)
     folder = save_result_bundle(result, tmp_path / "bundle", source, 3, ExtractorConfig())
-    assert {"original.png", "main_color.png", "labels.png", "threshold_mask.png", "input_alpha.png", "brightness_k_linear.png", "brightness_k_srgb.png", "asset_alpha_linear_k.png", "asset_alpha_srgb_k.png", "reconstruction_original_alpha.png", "palette.json"} <= {p.name for p in folder.iterdir()}
+    assert {"original.png", "main_color.png", "labels.png", "threshold_mask.png", "input_alpha.png", "brightness_k_linear.png", "brightness_k_srgb.png", "asset_alpha_linear_k.png", "asset_alpha_srgb_k.png", "reconstruction_original_alpha.png", "reconstruction_original_alpha_centroid.png", "palette.json"} <= {p.name for p in folder.iterdir()}
     palette = json.loads((folder / "palette.json").read_text(encoding="utf-8"))
     assert len(palette["palette_srgb"]) == 3
+    assert palette["optical_centroid"]["definition"] == "alpha-weighted linear Rec.709 luminance centroid"
 
 
 def test_version_three_exports_keep_input_alpha_separate_from_threshold_and_assets(tmp_path):
@@ -56,6 +57,32 @@ def test_version_three_exports_keep_input_alpha_separate_from_threshold_and_asse
     assert input_alpha[0, 0] in range(32760, 32780)
     assert threshold[0, 0] == 65535
     assert not (tmp_path / "bundle" / "reconstruction_green.png").exists()
+
+
+def test_optical_centroid_uses_alpha_weighted_linear_luminance_and_marks_it(tmp_path):
+    image = np.zeros((5, 7, 4), dtype=np.float32)
+    image[1, 1] = [1, 1, 1, 1]
+    image[3, 5] = [1, 1, 1, .5]
+    result = extract_brightness(
+        image,
+        1,
+        ExtractorConfig(
+            threshold_low=0,
+            threshold_high=.01,
+            restarts=1,
+            max_iterations=4,
+        ),
+    )
+    centroid = result.optical_centroid()
+    assert centroid["x_pixels"] == pytest.approx((1 + 5 * .5) / 1.5, abs=.02)
+    assert centroid["y_pixels"] == pytest.approx((1 + 3 * .5) / 1.5, abs=.02)
+    saved = result.save(tmp_path / "bundle")
+    marked = np.asarray(
+        Image.open(saved["reconstruction_original_alpha_centroid"]).convert("RGBA")
+    )
+    x = round(float(centroid["x_pixels"]))
+    y = round(float(centroid["y_pixels"]))
+    assert marked[y, x].tolist() == [255, 0, 0, 255]
 
 
 def test_brightness_threshold_candidates_use_the_requested_percentages_and_color_space(tmp_path):

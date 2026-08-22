@@ -57,7 +57,7 @@ def test_mixed_batch_continues_and_output_names_do_not_collide(tmp_path):
     assert [item.status for item in queue.items] == ["완료", "실패", "완료"]
     assert queue.items[0].result_dir.name != queue.items[2].result_dir.name
     assert queue.items[0].result_dir.parent.name == "same"
-    assert {"original.png", "asset_alpha_linear_k.png", "asset_alpha_srgb_k.png", "brightness_k_linear.png", "brightness_k_srgb.png", "labels.png", "reconstruction_original_alpha.png"} <= {path.name for path in queue.items[0].result_dir.iterdir()}
+    assert {"original.png", "asset_alpha_linear_k.png", "asset_alpha_srgb_k.png", "brightness_k_linear.png", "brightness_k_srgb.png", "labels.png", "reconstruction_original_alpha.png", "reconstruction_original_alpha_centroid.png"} <= {path.name for path in queue.items[0].result_dir.iterdir()}
     assert run.is_dir()
 
 

@@ -45,6 +45,14 @@ ApplicationWindow {
         }
     }
 
+    component AutoHideScrollBar: ScrollBar {
+        property bool scrolling: false
+        policy: ScrollBar.AsNeeded
+        active: scrolling || hovered || pressed
+        opacity: active ? 1 : 0
+        Behavior on opacity { NumberAnimation { duration: 140 } }
+    }
+
     component ZoomableImage: Flickable {
         id: zoomView
         property url imageSource: ""
@@ -60,6 +68,7 @@ ApplicationWindow {
                                                  ? Math.min(height, width * previewImage.sourceSize.height / previewImage.sourceSize.width)
                                                  : height
         clip: true
+        interactive: zoom > 1
         boundsBehavior: Flickable.StopAtBounds
         contentWidth: Math.max(width, previewImage.width)
         contentHeight: Math.max(height, previewImage.height)
@@ -285,8 +294,8 @@ ApplicationWindow {
                     contentItem: Label { text: parent.text; color: "white"; font.family: pretendardMedium.name; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                 }
                 Rectangle { Layout.fillWidth: true; Layout.fillHeight: true; color: "#272424"; radius: 5; border.color: "#49413e"; border.width: 1
-                    ListView { id: queueList; anchors.fill: parent; anchors.margins: 6; model: backend.items; clip: true; spacing: 5
-                        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AlwaysOn }
+                    ListView { id: queueList; objectName: "queueList"; anchors.fill: parent; anchors.margins: 6; model: backend.items; clip: true; spacing: 5
+                        ScrollBar.vertical: AutoHideScrollBar { scrolling: queueList.moving }
                         delegate: Rectangle { required property var modelData; required property int index
                             width: queueList.width; height: 86; radius: 4; color: backend.selectedIndex === index ? "#513a3b" : "#383332"
                             border.color: backend.selectedIndex === index ? "#c78383" : "transparent"
@@ -332,9 +341,9 @@ ApplicationWindow {
         }
 
         Rectangle { Layout.fillWidth: true; Layout.fillHeight: true; color: root.cream
-            ScrollView { id: settingsScroll; anchors.fill: parent; anchors.bottomMargin: 60; clip: true
+            ScrollView { id: settingsScroll; objectName: "settingsScroll"; anchors.fill: parent; anchors.bottomMargin: 60; clip: true
                 contentWidth: availableWidth
-                ScrollBar.vertical.policy: ScrollBar.AlwaysOn
+                ScrollBar.vertical: AutoHideScrollBar { scrolling: settingsScroll.contentItem ? settingsScroll.contentItem.moving : false }
                 ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
                 Item { id: settingsContent; width: settingsScroll.availableWidth; height: settingsColumn.implicitHeight + 52
             ColumnLayout { id: settingsColumn; x: 26; y: 26; width: parent.width - 52; spacing: 16
@@ -437,14 +446,18 @@ ApplicationWindow {
                                 Label { text: "Ctrl + 스크롤: 포인터 기준 확대/축소 · 최대 128×"; color: root.muted; font.pixelSize: 9 }
                             }
                             ZoomableImage { id: inputPreviewImage; Layout.fillWidth: true; Layout.fillHeight: true; imageSource: backend.selectedIndex >= 0 ? "file:///" + backend.items[backend.selectedIndex].path : "" }
-                            Rectangle { id: brightnessCandidateTable; Layout.fillWidth: true; Layout.preferredHeight: visible ? candidateGrid.implicitHeight + 35 : 0; visible: backend.selectedBrightnessCandidates.length > 0; color: "#f3ece3"; radius: 4; border.color: root.line
+                            Rectangle { id: brightnessCandidateTable; Layout.fillWidth: true; Layout.preferredHeight: visible ? Math.min(132, candidateGrid.implicitHeight + 37) : 0; Layout.minimumHeight: Layout.preferredHeight; visible: backend.selectedBrightnessCandidates.length > 0; color: "#f3ece3"; radius: 4; border.color: root.line; clip: true
                                 Label { anchors.left: parent.left; anchors.right: parent.right; anchors.leftMargin: 8; anchors.rightMargin: 8; anchors.top: parent.top; anchors.topMargin: 6; text: "상위 밝기 비율 → B 절단값 (하한 후보 · 현재 " + root.brightnessSpaceLabel() + " / " + root.brightnessMetricLabel() + ")"; elide: Text.ElideRight; color: root.muted; font.pixelSize: 9 }
-                                GridLayout { id: candidateGrid; anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom; anchors.margins: 6; columns: brightnessCandidateTable.width > 500 ? 5 : 3; rowSpacing: 4; columnSpacing: 4
-                                    Repeater { model: backend.selectedBrightnessCandidates
-                                        delegate: Rectangle { required property var modelData; implicitWidth: 76; implicitHeight: 27; color: "#fffaf2"; radius: 3
-                                            RowLayout { anchors.fill: parent; anchors.leftMargin: 5; anchors.rightMargin: 5; spacing: 2
-                                                Label { text: "상위 " + modelData.topPercent + "%"; color: root.muted; font.pixelSize: 8; Layout.fillWidth: true }
-                                                Label { text: modelData.threshold; color: root.ink; font.family: pretendardMedium.name; font.pixelSize: 9 }
+                                ScrollView { id: candidateScroll; objectName: "candidateScroll"; anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top; anchors.bottom: parent.bottom; anchors.leftMargin: 5; anchors.rightMargin: 5; anchors.topMargin: 28; anchors.bottomMargin: 5; clip: true; contentWidth: availableWidth
+                                    ScrollBar.vertical: AutoHideScrollBar { scrolling: candidateScroll.contentItem ? candidateScroll.contentItem.moving : false }
+                                    ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+                                    GridLayout { id: candidateGrid; width: candidateScroll.availableWidth; columns: width > 500 ? 5 : 3; rowSpacing: 4; columnSpacing: 4
+                                        Repeater { model: backend.selectedBrightnessCandidates
+                                            delegate: Rectangle { required property var modelData; Layout.fillWidth: true; Layout.minimumWidth: 72; implicitHeight: 27; color: "#fffaf2"; radius: 3
+                                                RowLayout { anchors.fill: parent; anchors.leftMargin: 5; anchors.rightMargin: 5; spacing: 2
+                                                    Label { text: "상위 " + modelData.topPercent + "%"; color: root.muted; font.pixelSize: 8; Layout.fillWidth: true }
+                                                    Label { text: modelData.threshold; color: root.ink; font.family: pretendardMedium.name; font.pixelSize: 9 }
+                                                }
                                             }
                                         }
                                     }
